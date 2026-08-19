@@ -11,32 +11,49 @@
 # silicon, then points donsetch at it with ORT_LIB_PATH.
 #
 # Usage:
-#   ./scripts/build-onnxruntime-noavx.sh [--jobs N] [--prefix DIR]
+#   ./scripts/build-onnxruntime-noavx.sh [--jobs N] [--prefix DIR] [--force]
 #
 # The default build dir is ./vendor/onnxruntime-noavx (git-ignored).
 # When it finishes it prints the exact `cargo build` command to run.
+# The script is idempotent: it skips straight to the summary if the
+# library already exists (useful for cached CI runs). Pass --force to
+# rebuild from scratch.
 #
 # Tip: compiling ONNX Runtime is heavy (30min-2h+). It is faster to build
 # it on any modern x86-64 machine and copy the resulting directory to the
 # target host — the library is CPU-agnostic as long as AVX is disabled.
 #
 # Requirements: git, cmake (>= 3.20), a C/C++ toolchain, python3,
-# and enough RAM/swap for the compiler (2-4GB is fine).
+# and enough RAM/swap for the compiler (2-4GB is fine). ninja-build is
+# used automatically when available for faster builds.
 
 set -euo pipefail
 
 # Match the ORT version pyke.io ships for ort 2.0.0-rc.12 (api-24 / 1.24.2).
 ORT_TAG="${ORT_TAG:-rel-1.24.2}"
-JOBS="${1:-}"
-PREFIX="${2:-${DONSETCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/vendor/onnxruntime-noavx}"
+JOBS=""
+PREFIX="${DONSETCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/vendor/onnxruntime-noavx"
+FORCE=0
 
-if [[ -n "$JOBS" ]]; then
-    shift
-fi
-if [[ "$#" -gt 0 && "$1" != "--prefix" && -z "${2:-}" ]]; then
-    # tolerate `script [--jobs N] DIR` positional form
-    PREFIX="$1"
-fi
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --jobs)
+            JOBS="$2"
+            shift 2
+            ;;
+        --prefix)
+            PREFIX="$2"
+            shift 2
+            ;;
+        --force)
+            FORCE=1
+            shift
+            ;;
+        *)
+            err "unknown argument: $1 (try --help)"
+            ;;
+    esac
+done
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -44,10 +61,24 @@ err() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 command -v git >/dev/null || err "git is required"
 command -v cmake >/dev/null || err "cmake is required (apt install cmake)"
 command -v python3 >/dev/null || err "python3 is required"
-command -v ninja >/dev/null || true
 
 SRC="$PREFIX/onnxruntime"
 BUILD="$PREFIX/build"
+LIB="$BUILD/libonnxruntime.a"
+
+# Fast path: already built (cached). Nothing to do.
+if [[ "$FORCE" -eq 0 && -f "$LIB" ]]; then
+    log "found existing non-AVX ONNX Runtime at $LIB — skipping rebuild"
+    cat <<EOF
+
+ONNX Runtime is built without AVX. Now build donsetch with the \`noavx\`
+feature and point it at this library:
+
+  export ORT_LIB_PATH="$BUILD"
+  cargo build --release --features ocr,rerank,noavx
+EOF
+    exit 0
+fi
 
 mkdir -p "$PREFIX"
 if [[ ! -d "$SRC/.git" ]]; then
@@ -57,8 +88,14 @@ else
     log "using existing checkout at $SRC"
 fi
 
+CMAKE_GEN=()
+if command -v ninja >/dev/null; then
+    CMAKE_GEN=(-G Ninja)
+    log "using ninja generator"
+fi
+
 log "configuring CMake build (AVX/AVX2/AVX512 disabled)"
-cmake -S "$SRC/cmake" -B "$BUILD" \
+cmake -S "$SRC/cmake" -B "$BUILD" "${CMAKE_GEN[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -Donnxruntime_USE_AVX=OFF \
@@ -86,7 +123,6 @@ cmake -S "$SRC/cmake" -B "$BUILD" \
 log "building (this is the slow step — be patient)"
 cmake --build "$BUILD" --config Release --parallel "${JOBS:-$(nproc)}"
 
-LIB="$BUILD/libonnxruntime.a"
 if [[ ! -f "$LIB" ]]; then
     # Fall back to whatever the build produced.
     LIB="$(find "$BUILD" -name 'libonnxruntime.a' | head -1)"
