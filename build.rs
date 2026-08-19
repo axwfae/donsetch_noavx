@@ -185,19 +185,15 @@ fn main() {
     // binaries; they must then link a locally-built non-AVX ONNX Runtime
     // via ORT_LIB_PATH. Verify the user wired that up and steer them
     // toward scripts/build-onnxruntime-noavx.sh if not.
-    let has_onnx = env::var_os("CARGO_FEATURE_OCR").is_some()
-        || env::var_os("CARGO_FEATURE_RERANK").is_some();
+    let has_onnx =
+        env::var_os("CARGO_FEATURE_OCR").is_some() || env::var_os("CARGO_FEATURE_RERANK").is_some();
     let dl_binaries = env::var_os("CARGO_FEATURE_DOWNLOAD_BINARIES").is_some();
     let noavx = env::var_os("CARGO_FEATURE_NOAVX").is_some();
     if has_onnx {
         let ort_lib = env::var("ORT_LIB_PATH")
             .ok()
             .filter(|p| !p.is_empty())
-            .or_else(|| {
-                env::var("ORT_LIB_LOCATION")
-                    .ok()
-                    .filter(|p| !p.is_empty())
-            });
+            .or_else(|| env::var("ORT_LIB_LOCATION").ok().filter(|p| !p.is_empty()));
         if noavx {
             if ort_lib.is_none() {
                 panic!(
