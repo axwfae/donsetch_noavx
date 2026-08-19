@@ -1,4 +1,4 @@
-# DonSeTch CI — build + test on Linux, macOS, Windows.
+# DonSeTch CI — build + test on Linux x86_64.
 #
 # The heavy dependencies need platform-specific setup:
 #   boring-sys (BoringSSL): CMake + C/C++ compiler + Go + bindgen (libclang)
@@ -6,11 +6,13 @@
 #   oar-ocr (ONNX Runtime):  download-binaries feature fetches at build time
 #
 # boring-sys needs Go because BoringSSL's build system is Go-based.
-# It needs NASM for x86_64 assembly crypto. On Windows it needs
-# LLVM/Clang for bindgen (pre-installed on Linux/macOS runners).
+# It needs NASM for x86_64 assembly crypto.
 #
 # Tests run in debug mode (no LTO) for speed. Release builds are
 # verified by the release workflow on tag push.
+#
+# macOS/Windows runners were removed to keep CI fast; Linux covers the
+# platform-independent Rust logic and the noavx path.
 
 name: CI
 
@@ -26,21 +28,8 @@ env:
 
 jobs:
   build-test:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - name: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
+    name: linux-x86_64
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
@@ -48,62 +37,29 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-          components: ${{ matrix.os == 'ubuntu-latest' && 'clippy, rustfmt' || '' }}
+          targets: x86_64-unknown-linux-gnu
+          components: clippy, rustfmt
 
       - name: Install Go
         uses: actions/setup-go@v7
         with:
           go-version: '>=1.22.0'
 
-      - name: Install NASM (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install NASM
         run: sudo apt-get update && sudo apt-get install -y nasm
-
-      - name: Install NASM (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install nasm
-
-      - name: Install NASM (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install nasm -y
-        shell: cmd
-
-      - name: Install LLVM (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "11.0"
-          directory: ${{ runner.temp }}/llvm
-
-      - name: Set LIBCLANG_PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          $clang = (Get-Command clang).Source
-          $libclangPath = Split-Path $clang
-          "LIBCLANG_PATH=$libclangPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Add NASM to PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-v3
+          key: linux-x86_64-v3
 
       - name: Test
-        run: cargo test --features ocr,rerank,download-binaries --target ${{ matrix.target }}
+        run: cargo test --features ocr,rerank,download-binaries --target x86_64-unknown-linux-gnu
 
       - name: Clippy
-        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --features ocr,rerank,download-binaries -- -Dwarnings
 
       - name: Format check
-        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
   # noavx build gate — the OCR/rerank code path must keep compiling with
