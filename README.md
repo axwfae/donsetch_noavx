@@ -122,13 +122,43 @@ Binary lands at `target/release/donsetch`. First build takes ~2 min (compiling B
 
 - **BoringSSL** is vendored and built from source via `boring-sys`. First build compiles it (~2 min), then cached.
 - **PDFium** is downloaded as a static library by `build.rs` — no manual setup.
-- **ONNX Runtime** is downloaded at build time by `oar-ocr` (OCR) and `ort` (reranker) when those features are enabled.
+- **ONNX Runtime** is downloaded at build time by `oar-ocr` (OCR) and `ort` (reranker) when you enable `--features download-binaries`.
 - **Models** (OCR + reranker) download on first use to `~/.cache/donsetch/`, not bundled in the binary.
-- **Feature flags**: `default = []` — the core tool (fetch, search, crawl, PDF) works standalone. Build with `--features ocr,rerank` for OCR + semantic reranking (pulls in ONNX Runtime). The prebuilt npm binary ships with both features enabled.
+- **Feature flags**: `default = []` — the core tool (fetch, search, crawl, PDF) works standalone. Build with `--features ocr,rerank,download-binaries` for OCR + semantic reranking (downloads prebuilt ONNX Runtime). The prebuilt npm binary ships with both features enabled. See "Build for CPUs without AVX" below for the `noavx` variant.
 - **Chromium** (optional): needed for tier 2 browser escalation on bot-walled sites. Linux: `pacman -S chromium`. macOS: `brew install chromium`. Windows: Edge works. **Ubuntu Snap**: set `DONGHOST_CHROME=/snap/chromium/current/usr/lib/chromium-browser/chrome` — the `/snap/bin/chromium` wrapper doesn't reliably pass CDP flags.
 - **Linux Xvfb**: for headful Chrome on Linux, `xorg-server-xvfb` is needed. DonSeTch starts Xvfb automatically.
-- **Linux ARM64 (aarch64)**: the default build (no features) works out of the box. If you enable `--features ocr,rerank`, ONNX Runtime's C++ global constructors may deadlock at startup on aarch64. Install `lld` for linking LLVM-produced PDFium archives (`apt install lld`).
+- **Linux ARM64 (aarch64)**: the default build (no features) works out of the box. If you enable `--features ocr,rerank,download-binaries`, ONNX Runtime's C++ global constructors may deadlock at startup on aarch64. Install `lld` for linking LLVM-produced PDFium archives (`apt install lld`).
 - **Termux (Android)**: the default build works. Install `pkg install rust clang make pkg-config go` and `cargo build --release`. Chromium: `pkg install x11-repo && pkg install chromium`. DonSeTch auto-detects Termux and uses headless mode (no Xvfb needed). Install `lld` for PDFium linking: `pkg install lld`.
+
+<details>
+<summary><b>Build for CPUs without AVX</b></summary>
+
+The prebuilt ONNX Runtime binaries used by `ocr`/`rerank` target **x86-64-v3**
+(AVX2+FMA) and crash with `SIGILL` on CPUs without AVX — Intel Bay Trail
+Atom/Celeron (N3540, J1900, ...), which only have SSE4.2. On such hardware,
+build ONNX Runtime from source with AVX disabled and link it locally:
+
+```bash
+# 1) Compile ONNX Runtime without AVX (slow, ~30min-2h; can be done on any
+#    modern x86-64 machine and the result copied over).
+./scripts/build-onnxruntime-noavx.sh
+
+# 2) Build donsetch against it.
+export ORT_LIB_PATH="$PWD/vendor/onnxruntime-noavx/build"
+cargo build --release --features ocr,rerank,noavx
+```
+
+Notes:
+
+- The core tool (no features, `cargo build --release`) has **no** AVX
+  requirement at all — it runs on these CPUs as-is. `noavx` only matters
+  if you want OCR / semantic reranking.
+- `--features noavx` and `--features download-binaries` are mutually
+  exclusive in effect: enable exactly one of them (never both).
+- The build script also works when run on a faster machine — the produced
+  `libonnxruntime.a` is CPU-agnostic once AVX is disabled.
+
+</details>
 
 </details>
 
@@ -569,7 +599,7 @@ DonSeTch is install and use. wigolo is install, download ~1.5 GB of models and b
 |---|---|
 | First build takes ~2 min | BoringSSL is compiled from source. Cached after that. |
 | Go is a build dependency | BoringSSL's build system is Go-based. You need Go even though DonSeTch is Rust. |
-| OCR/rerank not in default build | ONNX Runtime's C++ global constructors can deadlock on aarch64. Build with `--features ocr,rerank` to enable. The prebuilt npm binary ships with both. |
+| OCR/rerank not in default build | ONNX Runtime's C++ global constructors can deadlock on aarch64. Build with `--features ocr,rerank,download-binaries` to enable (or `--features ocr,rerank,noavx` with `ORT_LIB_PATH` on CPUs without AVX). The prebuilt npm binary ships with both. |
 | Interactive captchas not solved | hCaptcha, reCAPTCHA, Turnstile checkbox = honest dead end. No solving service by design. |
 | robots.txt ON by default for crawl | `respect_robots=true` for crawl. `fetch` doesn't check robots. |
 | Search rate-limits without a proxy | Keyless search scrapes public engines from your IP. Set `DONSEEK_PROXIES` for heavy use. |
@@ -591,7 +621,7 @@ DonSeTch is install and use. wigolo is install, download ~1.5 GB of models and b
 
 ## 🤝 Contributing
 
-PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Run `cargo clippy --features ocr,rerank -- -Dwarnings` and `cargo test --features ocr,rerank` before submitting. AGPL v3 — all contributions under the same license.
+PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Run `cargo clippy --features ocr,rerank,download-binaries -- -Dwarnings` and `cargo test --features ocr,rerank,download-binaries` before submitting. AGPL v3 — all contributions under the same license.
 
 ## 📄 License
 

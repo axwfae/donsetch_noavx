@@ -8,7 +8,7 @@ Thanks for your interest in contributing. DonSeTch is AGPL v3 — all contributi
 git clone https://github.com/dondai44423/donsetch.git
 cd donsetch
 cargo build --release                     # core build (fetch, search, crawl, PDF)
-cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking)
+cargo build --release --features ocr,rerank,download-binaries  # full build (adds OCR + semantic reranking)
 ```
 
 **Prerequisites**: Rust 1.75+, Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#install) for platform-specific install commands.
@@ -16,8 +16,8 @@ cargo build --release --features ocr,rerank  # full build (adds OCR + semantic r
 ## Development workflow
 
 ```bash
-cargo test --features ocr,rerank          # 485 tests
-cargo clippy --features ocr,rerank -- -Dwarnings   # zero warnings enforced
+cargo test --features ocr,rerank,download-binaries          # 485 tests
+cargo clippy --features ocr,rerank,download-binaries -- -Dwarnings   # zero warnings enforced
 cargo fmt --all -- --check    # formatting check
 ```
 
@@ -70,7 +70,7 @@ DonSeTch is built from scratch — no dependency on existing OSS web tooling:
 
 1. Fork the repo, create a branch (`feat/...`, `fix/...`, `docs/...`).
 2. Write tests for your change.
-3. Ensure `cargo test --features ocr,rerank`, `cargo clippy --features ocr,rerank -- -Dwarnings`, and `cargo fmt --check` all pass.
+3. Ensure `cargo test --features ocr,rerank,download-binaries`, `cargo clippy --features ocr,rerank,download-binaries -- -Dwarnings`, and `cargo fmt --check` all pass.
 4. Open a PR with a conventional commit title.
 5. CI must be green on all 3 platforms before merge.
 

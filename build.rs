@@ -176,6 +176,55 @@ fn main() {
         }
     }
 
+    // ── noavx + ONNX linking guidance ─────────────────────────
+    //
+    // pyke.io's prebuilt ONNX Runtime x86-64 binaries require x86-64-v3
+    // (AVX2+FMA) and crash with SIGILL on CPUs without AVX (Bay Trail
+    // Atom/Celeron N3540, J1900, ... only have SSE4.2). The `noavx`
+    // feature switches `ort`/`oar-ocr` away from downloading those
+    // binaries; they must then link a locally-built non-AVX ONNX Runtime
+    // via ORT_LIB_PATH. Verify the user wired that up and steer them
+    // toward scripts/build-onnxruntime-noavx.sh if not.
+    let has_onnx = env::var_os("CARGO_FEATURE_OCR").is_some()
+        || env::var_os("CARGO_FEATURE_RERANK").is_some();
+    let dl_binaries = env::var_os("CARGO_FEATURE_DOWNLOAD_BINARIES").is_some();
+    let noavx = env::var_os("CARGO_FEATURE_NOAVX").is_some();
+    if has_onnx {
+        let ort_lib = env::var("ORT_LIB_PATH")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                env::var("ORT_LIB_LOCATION")
+                    .ok()
+                    .filter(|p| !p.is_empty())
+            });
+        if noavx {
+            if ort_lib.is_none() {
+                panic!(
+                    "donsetch: `noavx` is enabled but ONNX Runtime has no library to link.\n\
+                     The `noavx` feature disables downloading prebuilt (AVX-requiring) ONNX \
+                     Runtime binaries; you must compile a non-AVX ONNX Runtime and point to it:\n\n  \
+                     ORT_LIB_PATH=/path/to/onnxruntime/build ... cargo build --features ocr,rerank,noavx\n\n\
+                     scripts/build-onnxruntime-noavx.sh automates the ONNX Runtime source build \
+                     (CMake with AVX disabled). See README section \"Build for CPUs without AVX\"."
+                );
+            }
+            eprintln!(
+                "donsetch: building with `noavx` — linking ONNX Runtime from {} \
+                 (no AVX required).",
+                ort_lib.unwrap()
+            );
+        } else if !dl_binaries {
+            println!(
+                "cargo:warning=donsetch: OCR/rerank are enabled but neither `download-binaries` \
+                 nor `noavx` is selected.\n  - AVX-capable CPU (Haswell+): add \
+                 `--features download-binaries`.\n  - CPU without AVX (e.g. N3540/J1900): add \
+                 `--features noavx` and set ORT_LIB_PATH (see scripts/build-onnxruntime-noavx.sh).\n\
+                 Without one of them, `ort-sys` will fail to link ONNX Runtime."
+            );
+        }
+    }
+
     // ── Compile-time metadata for `donsetch -v` ────────────────
     // Captured here so the binary self-reports its build identity.
 
