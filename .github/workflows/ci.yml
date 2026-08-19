@@ -96,12 +96,45 @@ jobs:
           key: ${{ matrix.target }}-v3
 
       - name: Test
-        run: cargo test --features ocr,rerank --target ${{ matrix.target }}
+        run: cargo test --features ocr,rerank,download-binaries --target ${{ matrix.target }}
 
       - name: Clippy
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --features ocr,rerank -- -Dwarnings
+        run: cargo clippy --features ocr,rerank,download-binaries -- -Dwarnings
 
       - name: Format check
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
+
+  # noavx build gate — the OCR/rerank code path must keep compiling with
+  # the `noavx` feature (ONNX Runtime linked from ORT_LIB_PATH instead of
+  # downloaded AVX binaries). We point ort-sys at a stub library so the
+  # build script passes; `cargo check` never actually links it. The real
+  # no-AVX binary is built by the release workflow (build-noavx-linux).
+  noavx-check:
+    name: noavx-check (linux-x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: noavx-check-v1
+
+      - name: Check (noavx feature, stub ONNX library)
+        run: |
+          mkdir -p /tmp/fake-ort && touch /tmp/fake-ort/libonnxruntime.a
+          ORT_LIB_PATH=/tmp/fake-ort cargo check --features ocr,rerank,noavx
