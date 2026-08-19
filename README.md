@@ -135,8 +135,15 @@ Binary lands at `target/release/donsetch`. First build takes ~2 min (compiling B
 
 The prebuilt ONNX Runtime binaries used by `ocr`/`rerank` target **x86-64-v3**
 (AVX2+FMA) and crash with `SIGILL` on CPUs without AVX — Intel Bay Trail
-Atom/Celeron (N3540, J1900, ...), which only have SSE4.2. On such hardware,
-build ONNX Runtime from source with AVX disabled and link it locally:
+Atom/Celeron (N3540, J1900, ...), which only have SSE4.2.
+
+**Fast path (prebuilt)**: every GitHub Release also ships a
+`donsetch-linux-x64-noavx.tar.gz` artifact built by CI with AVX disabled.
+Download it from the release page and drop the `donsetch` binary into your
+`PATH` — no build tools needed.
+
+**Build path**: or build ONNX Runtime from source with AVX disabled and link
+it locally:
 
 ```bash
 # 1) Compile ONNX Runtime without AVX (slow, ~30min-2h; can be done on any
