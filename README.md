@@ -198,6 +198,25 @@ Notes:
 
 ---
 
+## 🧪 安装后：请先读 TESTING.md（重要）
+
+> **安装完成后的第一件事：阅读 [TESTING.md](TESTING.md)。**
+>
+> TESTING.md 整理了**完整的安装 → 验证 → 功能测试指引**，每一项都带
+> 可直接照抄的命令与**预期结果**（实测通过），包括：
+>
+> - 无 AVX CPU 上 noavx 版二进制的安装与 SHA256 校验
+> - `fetch` / `search` / `crawl`（含 resume 续爬）/ PDF OCR / MCP 的快速测试命令
+> - 已知限制（tier 2 浏览器、update/rollback、SSRF 防护等）
+>
+> 另外，**OCR 测试样张 `ocr-sample-scan.pdf`** 已保存在本目录（单页扫描样张，
+> 无文本层），可配合 TESTING.md 第 3.5 节进行 OCR 验证，无需上网另行找寻。
+>
+> 安装后按 TESTING.md 逐项执行即可，**无需重新摸索**，
+> 能大幅减少无用动作与重复排障。
+
+---
+
 ## 🎯 Two ways to use it
 
 DonSeTch is **one binary, two interfaces**. Same engine, same output, same reliability.
