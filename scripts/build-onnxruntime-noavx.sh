@@ -124,6 +124,17 @@ cmake -S "$SRC/cmake" -B "$BUILD" "${CMAKE_GEN[@]}" \
 log "building (this is the slow step — be patient)"
 cmake --build "$BUILD" --config Release --parallel "${JOBS:-$(nproc)}"
 
+# re2 is declared as EXCLUDE_FROM_ALL (cmake/external/onnxruntime_external_deps.cmake)
+# and linked only through the INTERFACE `onnxruntime` target, so the static
+# build never compiles it on its own even though kernel code (regex_full_match,
+# tokenizer) references it — the linker errors with undefined re2::RE2 symbols.
+# Build it explicitly; the consolidation step below merges it into
+# libonnxruntime.a.
+if [[ ! -f "$BUILD/_deps/re2-build/libre2.a" ]]; then
+    log "building re2 (EXCLUDE_FROM_ALL FetchContent dependency)"
+    cmake --build "$BUILD" --config Release --target re2 --parallel "${JOBS:-$(nproc)}"
+fi
+
 if [[ ! -f "$LIB" ]]; then
     # ONNX Runtime's CMake build produces a set of modular static archives
     # (libonnxruntime_{session,providers,optimizer,lora,framework,graph,util,
