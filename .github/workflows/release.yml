@@ -143,7 +143,7 @@ jobs:
             onnx-noavx-${{ runner.os }}-
 
       - name: Build ONNX Runtime without AVX
-        run: ./scripts/build-onnxruntime-noavx.sh --jobs $(nproc)
+        run: bash ./scripts/build-onnxruntime-noavx.sh --jobs $(nproc)
 
       - name: Set ORT_LIB_PATH
         run: echo "ORT_LIB_PATH=$PWD/vendor/onnxruntime-noavx/build" >> "$GITHUB_ENV"
