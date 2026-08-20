@@ -24,8 +24,9 @@
 # target host — the library is CPU-agnostic as long as AVX is disabled.
 #
 # Requirements: git, cmake (>= 3.20), a C/C++ toolchain, python3,
-# and enough RAM/swap for the compiler (2-4GB is fine). ninja-build is
-# used automatically when available for faster builds.
+# binutils (for `ar`), and enough RAM/swap for the compiler (2-4GB is
+# fine). ninja-build is used automatically when available for faster
+# builds.
 
 set -euo pipefail
 
@@ -124,10 +125,33 @@ log "building (this is the slow step — be patient)"
 cmake --build "$BUILD" --config Release --parallel "${JOBS:-$(nproc)}"
 
 if [[ ! -f "$LIB" ]]; then
-    # Fall back to whatever the build produced.
-    LIB="$(find "$BUILD" -name 'libonnxruntime.a' | head -1)"
+    # ONNX Runtime's CMake build produces a set of modular static archives
+    # (libonnxruntime_{session,providers,optimizer,lora,framework,graph,util,
+    # mlas,common,flatbuffers}.a) plus third-party archives under
+    # build/_deps, but never a single-file libonnxruntime.a — when
+    # BUILD_SHARED_LIB=OFF the `onnxruntime` target is just INTERFACE.
+    # ort-sys's ORT_LIB_PATH path expects a single libonnxruntime.a, so we
+    # consolidate everything into one archive (mirroring pyke.io's
+    # "single-file" build). The linker only pulls in the members it needs,
+    # so including all dependency archives is safe.
+    command -v ar >/dev/null || err "ar (binutils) is required to consolidate the static archives"
+    mapfile -t local_archives < <(find "$BUILD" -maxdepth 1 -name 'libonnxruntime_*.a' | sort)
+    mapfile -t dep_archives < <(find "$BUILD/_deps" -name 'lib*.a' ! -name 'libprotoc.a' 2>/dev/null | sort)
+    if (( ${#local_archives[@]} == 0 )); then
+        err "build finished but no libonnxruntime_*.a archives were found under $BUILD"
+    fi
+    log "consolidating ${#local_archives[@]} ORT + ${#dep_archives[@]} dependency archives into libonnxruntime.a"
+    rm -f "$LIB"
+    {
+        echo "create $LIB"
+        for a in "${local_archives[@]}" "${dep_archives[@]}"; do
+            echo "addlib $a"
+        done
+        echo "save"
+        echo "end"
+    } | ar -M
 fi
-[[ -n "$LIB" ]] || err "build finished but libonnxruntime.a was not found under $BUILD"
+[[ -f "$LIB" ]] || err "build finished but libonnxruntime.a was not produced under $BUILD"
 
 log "done: $LIB"
 cat <<EOF
