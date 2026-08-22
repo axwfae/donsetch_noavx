@@ -1,0 +1,214 @@
+# DonSeTch Release — build prebuilt Linux binaries.
+#
+# Triggers on tag push (v*). Builds release binaries on Linux x86_64,
+# packages them with SHA256 checksums, and creates a draft GitHub
+# release with all artifacts attached.
+#
+# Artifact naming (npm-compatible for the npm wrapper package):
+#   donsetch-linux-x64.tar.gz       (Linux x86_64, AVX-capable)
+#   donsetch-linux-x64-noavx.tar.gz (Linux x86_64, CPUs WITHOUT AVX)
+#
+# macOS/Windows builds were removed to keep releases fast; only Linux is
+# produced, including the no-AVX variant for Bay Trail CPUs.
+#
+# The `-noavx` variant is built by build-noavx-linux: it compiles ONNX
+# Runtime from source with AVX/AVX2/AVX512 disabled (via
+# scripts/build-onnxruntime-noavx.sh) and links it with the `noavx`
+# feature. It runs on a normal AVX runner; the produced binary is what
+# runs on SSE2/SSE4.2-only CPUs (Bay Trail N3540/J1900, ...).
+# The ONNX source build is expensive (~30min-2h), so it is cached.
+#
+# Build steps mirror ci.yml exactly (same toolchain, same deps).
+# The only additions are: binary verification, packaging, checksums.
+
+name: Release
+
+# GITHUB_TOKEN needs contents:write to create releases and
+# actions:write to upload artifacts. These are not default in
+# restricted repos.
+permissions:
+  contents: write
+  actions: write
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build linux-x64
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+          cache: false
+
+      - name: Install NASM
+        timeout-minutes: 5
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-x64
+
+      - name: Build
+        run: cargo build --release --features ocr,rerank,download-binaries --target x86_64-unknown-linux-gnu
+
+      # Verify the binary actually runs — catches broken cross-target
+      # builds, missing DLLs, and link-time issues that don't show
+      # up as compile errors.
+      - name: Verify binary runs
+        shell: bash
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          output=$(./donsetch 2>&1 || true)
+          if [ -z "$output" ]; then
+            echo "ERROR: binary produced no output"
+            exit 1
+          fi
+          echo "OK: $(echo "$output" | head -1)"
+
+      # ── Package ──────────────────────────────────────────────
+      # tar.gz keeps npm install.js happy (one extraction method).
+      # The binary is already stripped (strip=true in release profile).
+
+      - name: Package
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf $GITHUB_WORKSPACE/donsetch-linux-x64.tar.gz donsetch
+
+      # ── Checksums ────────────────────────────────────────────
+      # sha256sum format: "<hash>  <filename>" — compatible with
+      # `sha256sum -c`.
+
+      - name: Compute SHA256
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          sha256sum donsetch-linux-x64.tar.gz | tee donsetch-linux-x64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: donsetch-linux-x64
+          path: donsetch-linux-x64.*
+
+  # ── Linux x86_64 no-AVX build ─────────────────────────────
+  # For CPUs without AVX (Intel Bay Trail N3540/J1900, ...). ONNX Runtime
+  # is compiled from source with AVX disabled; `donsetch` links it via
+  # ORT_LIB_PATH with the `noavx` feature. The ONNX build is cached so
+  # subsequent releases skip the ~1-2h source build.
+  build-noavx-linux:
+    name: Build linux-x64-noavx
+    runs-on: ubuntu-latest
+    env:
+      ORT_TAG: rel-1.24.2
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+          cache: false
+
+      - name: Install build deps (NASM, ninja)
+        timeout-minutes: 5
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm ninja-build
+
+      - name: Cache ONNX Runtime no-AVX build
+        uses: actions/cache@v4
+        with:
+          path: vendor/onnxruntime-noavx
+          key: onnx-noavx-${{ runner.os }}-${{ env.ORT_TAG }}
+          restore-keys: |
+            onnx-noavx-${{ runner.os }}-
+
+      - name: Build ONNX Runtime without AVX
+        run: bash ./scripts/build-onnxruntime-noavx.sh --jobs $(nproc)
+
+      - name: Set ORT_LIB_PATH
+        run: echo "ORT_LIB_PATH=$PWD/vendor/onnxruntime-noavx/build" >> "$GITHUB_ENV"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-x64-noavx
+
+      - name: Build donsetch (noavx)
+        run: cargo build --release --features ocr,rerank,noavx
+
+      - name: Verify binary runs
+        run: |
+          cd target/release
+          output=$(./donsetch 2>&1 || true)
+          if [ -z "$output" ]; then
+            echo "ERROR: binary produced no output"
+            exit 1
+          fi
+          echo "OK: $(echo "$output" | head -1)"
+
+      # ── Package ──────────────────────────────────────────
+      - name: Package
+        run: |
+          cd target/release
+          tar czf $GITHUB_WORKSPACE/donsetch-linux-x64-noavx.tar.gz donsetch
+
+      - name: Compute SHA256
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          sha256sum donsetch-linux-x64-noavx.tar.gz | tee donsetch-linux-x64-noavx.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: donsetch-linux-x64-noavx
+          path: donsetch-linux-x64-noavx.*
+
+  release:
+    name: Create Release
+    needs: [build, build-noavx-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/donsetch-*.tar.gz
+            artifacts/donsetch-*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
