@@ -89,18 +89,6 @@ Works with every MCP client: Claude Code, Cursor, OpenCode, Pi, anything that sp
 
 ---
 
-## 🎬 Demo
-
-<div align="center">
-
-<video src="https://github.com/user-attachments/assets/32bc0899-87bf-417b-8ca8-c0a4a51ee167" controls muted width="640"></video>
-
-</div>
-
-*(30-second walkthrough: search, fetch with bot-wall bypass, and crawl)*
-
----
-
 ## 📦 Install
 
 ### Option 1 — npm (recommended)
