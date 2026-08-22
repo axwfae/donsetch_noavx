@@ -1,15 +1,22 @@
-# DonSeTch Release — build prebuilt binaries for Linux, macOS, Windows.
+# DonSeTch Release — build prebuilt Linux binaries.
 #
-# Triggers on tag push (v*). Builds release binaries on 3 platforms,
+# Triggers on tag push (v*). Builds release binaries on Linux x86_64,
 # packages them with SHA256 checksums, and creates a draft GitHub
 # release with all artifacts attached.
 #
 # Artifact naming (npm-compatible for the npm wrapper package):
-#   donsetch-linux-x64.tar.gz       (Linux x86_64)
-#   donsetch-linux-arm64.tar.gz     (Linux ARM64 / aarch64)
-#   donsetch-darwin-arm64.tar.gz    (macOS arm64)
-#   donsetch-darwin-x64.tar.gz      (macOS Intel)
-#   donsetch-win32-x64.tar.gz       (Windows x86_64 + pdfium.dll)
+#   donsetch-linux-x64.tar.gz       (Linux x86_64, AVX-capable)
+#   donsetch-linux-x64-noavx.tar.gz (Linux x86_64, CPUs WITHOUT AVX)
+#
+# macOS/Windows builds were removed to keep releases fast; only Linux is
+# produced, including the no-AVX variant for Bay Trail CPUs.
+#
+# The `-noavx` variant is built by build-noavx-linux: it compiles ONNX
+# Runtime from source with AVX/AVX2/AVX512 disabled (via
+# scripts/build-onnxruntime-noavx.sh) and links it with the `noavx`
+# feature. It runs on a normal AVX runner; the produced binary is what
+# runs on SSE2/SSE4.2-only CPUs (Bay Trail N3540/J1900, ...).
+# The ONNX source build is expensive (~30min-2h), so it is cached.
 #
 # Build steps mirror ci.yml exactly (same toolchain, same deps).
 # The only additions are: binary verification, packaging, checksums.
@@ -34,34 +41,8 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            features: --features ocr,rerank
-          - name: linux-arm64
-            os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            features: ''
-          - name: darwin-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            features: --features ocr,rerank
-          - name: darwin-x64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            # ort-sys ships no prebuilt ONNX Runtime for x86_64-apple-darwin —
-            # core build (same trade-off as linux-arm64).
-            features: ''
-          - name: win32-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            features: --features ocr,rerank
+    name: Build linux-x64
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
@@ -69,61 +50,25 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
       - name: Install Go
         uses: actions/setup-go@v7
         with:
           go-version: '>=1.22.0'
+          cache: false
 
-      - name: Install NASM (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install NASM
         timeout-minutes: 5
         run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
-
-      - name: Install LLD (Linux ARM64)
-        if: matrix.os == 'ubuntu-24.04-arm'
-        timeout-minutes: 5
-        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends lld
-
-      - name: Install NASM (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: brew install nasm
-
-      - name: Install NASM (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install nasm -y
-        shell: cmd
-
-      - name: Install LLVM (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "11.0"
-          directory: ${{ runner.temp }}/llvm
-
-      - name: Set LIBCLANG_PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          $clang = (Get-Command clang).Source
-          $libclangPath = Split-Path $clang
-          "LIBCLANG_PATH=$libclangPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Add NASM to PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-linux-x64
 
       - name: Build
-        run: cargo build --release ${{ matrix.features }} --target ${{ matrix.target }}
-        timeout-minutes: 30
+        run: cargo build --release --features ocr,rerank,download-binaries --target x86_64-unknown-linux-gnu
 
       # Verify the binary actually runs — catches broken cross-target
       # builds, missing DLLs, and link-time issues that don't show
@@ -131,10 +76,8 @@ jobs:
       - name: Verify binary runs
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          BIN=donsetch
-          if [ -f donsetch.exe ]; then BIN=donsetch.exe; fi
-          output=$(./$BIN 2>&1 || true)
+          cd target/x86_64-unknown-linux-gnu/release
+          output=$(./donsetch 2>&1 || true)
           if [ -z "$output" ]; then
             echo "ERROR: binary produced no output"
             exit 1
@@ -142,48 +85,110 @@ jobs:
           echo "OK: $(echo "$output" | head -1)"
 
       # ── Package ──────────────────────────────────────────────
-      # All platforms: tar.gz. Windows includes pdfium.dll alongside
-      # donsetch.exe. Using tar.gz (not zip) for all platforms means
-      # the npm install.js postinstall only needs one extraction
-      # method (tar xzf), and tar is built into Windows 10+.
+      # tar.gz keeps npm install.js happy (one extraction method).
       # The binary is already stripped (strip=true in release profile).
 
-      - name: Package (Unix)
-        if: matrix.os != 'windows-latest'
+      - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch
-
-      - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: cmd
-        run: |
-          cd target\${{ matrix.target }}\release
-          if not exist pdfium.dll (
-            echo ERROR: pdfium.dll not found - build.rs copy failed
-            exit 1
-          )
-          tar czf %GITHUB_WORKSPACE%\donsetch-${{ matrix.name }}.tar.gz donsetch.exe pdfium.dll
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf $GITHUB_WORKSPACE/donsetch-linux-x64.tar.gz donsetch
 
       # ── Checksums ────────────────────────────────────────────
       # sha256sum format: "<hash>  <filename>" — compatible with
-      # `sha256sum -c` on Linux/macOS.
+      # `sha256sum -c`.
 
       - name: Compute SHA256
         shell: bash
         run: |
           cd "$GITHUB_WORKSPACE"
-          sha256sum donsetch-${{ matrix.name }}.tar.gz | tee donsetch-${{ matrix.name }}.tar.gz.sha256
+          sha256sum donsetch-linux-x64.tar.gz | tee donsetch-linux-x64.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: donsetch-${{ matrix.name }}
-          path: donsetch-${{ matrix.name }}.*
+          name: donsetch-linux-x64
+          path: donsetch-linux-x64.*
+
+  # ── Linux x86_64 no-AVX build ─────────────────────────────
+  # For CPUs without AVX (Intel Bay Trail N3540/J1900, ...). ONNX Runtime
+  # is compiled from source with AVX disabled; `donsetch` links it via
+  # ORT_LIB_PATH with the `noavx` feature. The ONNX build is cached so
+  # subsequent releases skip the ~1-2h source build.
+  build-noavx-linux:
+    name: Build linux-x64-noavx
+    runs-on: ubuntu-latest
+    env:
+      ORT_TAG: rel-1.24.2
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+          cache: false
+
+      - name: Install build deps (NASM, ninja)
+        timeout-minutes: 5
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm ninja-build
+
+      - name: Cache ONNX Runtime no-AVX build
+        uses: actions/cache@v4
+        with:
+          path: vendor/onnxruntime-noavx
+          key: onnx-noavx-${{ runner.os }}-${{ env.ORT_TAG }}
+          restore-keys: |
+            onnx-noavx-${{ runner.os }}-
+
+      - name: Build ONNX Runtime without AVX
+        run: bash ./scripts/build-onnxruntime-noavx.sh --jobs $(nproc)
+
+      - name: Set ORT_LIB_PATH
+        run: echo "ORT_LIB_PATH=$PWD/vendor/onnxruntime-noavx/build" >> "$GITHUB_ENV"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-x64-noavx
+
+      - name: Build donsetch (noavx)
+        run: cargo build --release --features ocr,rerank,noavx
+
+      - name: Verify binary runs
+        run: |
+          cd target/release
+          output=$(./donsetch 2>&1 || true)
+          if [ -z "$output" ]; then
+            echo "ERROR: binary produced no output"
+            exit 1
+          fi
+          echo "OK: $(echo "$output" | head -1)"
+
+      # ── Package ──────────────────────────────────────────
+      - name: Package
+        run: |
+          cd target/release
+          tar czf $GITHUB_WORKSPACE/donsetch-linux-x64-noavx.tar.gz donsetch
+
+      - name: Compute SHA256
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          sha256sum donsetch-linux-x64-noavx.tar.gz | tee donsetch-linux-x64-noavx.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: donsetch-linux-x64-noavx
+          path: donsetch-linux-x64-noavx.*
 
   release:
     name: Create Release
-    needs: build
+    needs: [build, build-noavx-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
