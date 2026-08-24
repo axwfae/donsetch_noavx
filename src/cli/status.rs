@@ -11,7 +11,7 @@ use crate::profile::BrowserProfile;
 use crate::search::byok::store::ByokConfig;
 use crate::transport::proxy;
 
-const REPO: &str = "dondai44423/donsetch";
+const REPO: &str = "axwfae/donsetch_noavx";
 
 pub async fn run() {
     cli::init();

@@ -26,7 +26,13 @@ libc = "0.2"
 dirs = "6"
 unicode-bidi = "0.3"
 # OCR tier (Tier B) — PP-OCR via ONNX Runtime, lazy model cache.
-oar-ocr = { version = "0.9", default-features = false, features = ["download-binaries", "simd"], optional = true }
+#
+# `download-binaries` is NOT enabled here by default. It is toggled by the
+# top-level `download-binaries` feature so that `noavx` builds (CPUs without
+# AVX, e.g. Bay Trail Atom N3540 / Celeron J1900) can link a locally-built
+# non-AVX ONNX Runtime via ORT_LIB_PATH instead of pyke.io's prebuilt
+# binaries (whose x86-64 baseline is x86-64-v3, i.e. AVX2+FMA).
+oar-ocr = { version = "0.9", default-features = false, features = ["simd"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 sha2 = "0.11"
@@ -39,7 +45,7 @@ semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
 # Semantic reranker — cross-encoder via ONNX Runtime, shares ort with OCR.
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "copy-dylibs"], optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "copy-dylibs"], optional = true }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 ndarray = { version = "0.17", optional = true }
 
@@ -48,10 +54,20 @@ ndarray = { version = "0.17", optional = true }
 # works standalone. OCR and semantic reranking pull in ONNX Runtime,
 # a heavy C++ dependency whose static global constructors can deadlock
 # on some platforms (notably aarch64 Linux, see issue #9). CI and release
-# builds explicitly enable both with `--features ocr,rerank`.
+# builds explicitly enable both with `--features ocr,rerank,download-binaries`.
 default = []
 ocr = ["dep:oar-ocr", "dep:image", "reqwest/blocking"]
 rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "reqwest/blocking"]
+# Download prebuilt ONNX Runtime binaries at build time (pyke.io builds).
+# Their x86-64 binaries target x86-64-v3 (AVX2+FMA) and will SIGILL on
+# CPUs without AVX — see the `noavx` feature for those machines.
+download-binaries = ["oar-ocr/download-binaries", "ort/download-binaries", "ort/tls-native"]
+# Build/link a locally-compiled ONNX Runtime that does NOT require AVX.
+# Use with `--features ocr,rerank,noavx` and point `ORT_LIB_PATH` at a
+# ONNX Runtime built from source with AVX disabled (see
+# scripts/build-onnxruntime-noavx.sh). Mutually exclusive in effect with
+# `download-binaries`: do not enable both.
+noavx = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry"] }

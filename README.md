@@ -14,12 +14,40 @@ Works with **Claude Code**, **Cursor**, **OpenCode**, **Pi**, **Windsurf**, and 
 
 <br>
 
+> ## ⚠️ Before you install — check whether your CPU supports AVX
+>
+> DonSeTch's OCR and semantic reranking run on ONNX Runtime, and its prebuilt
+> binaries target **x86-64-v3 (AVX2 + FMA)**. On a CPU **without AVX** — e.g.
+> Intel Bay Trail Atom/Celeron (N3540, J1900, ...), which only has SSE4.2 —
+> that binary crashes instantly with `SIGILL`.
+>
+> **Always check your CPU first, then install the matching binary:**
+>
+> ```bash
+> grep -m1 -o 'avx[0-9]*' /proc/cpuinfo   # prints `avx`/`avx2` if supported, nothing if not
+> lscpu | grep -i avx                     # alternative
+> ```
+>
+> | Your CPU | Install this binary |
+> |---|---|
+> | ✅ Supports AVX/AVX2 | `donsetch-linux-x64.tar.gz` (or `npm install -g donsetch`) |
+> | ❌ No AVX (old / low-end) | **`donsetch-linux-x64-noavx.tar.gz`** — runs on both AVX and non-AVX CPUs |
+>
+> > **Special attention / 特別關注**
+> >
+> > - ❌ Standard binary on a no-AVX CPU → **instant `SIGILL` crash** (illegal instruction). No error message, no warning, nothing to diagnose.
+> > - ✅ The `noavx` binary works on **both** AVX and non-AVX CPUs — **when in doubt, use `noavx`.**
+> > - ✅ Only OCR and semantic reranking are affected. The core tool (fetch / search / crawl / PDF) has **no** AVX requirement at all.
+> > - 🔗 More details & the from-source build path: [Build for CPUs without AVX](#-install).
+
+<br>
+
 <div align="center">
 
 [![npm](https://img.shields.io/npm/v/donsetch?color=cb3837&logo=npm)](https://www.npmjs.com/package/donsetch)
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
-[![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
-[![CI](https://img.shields.io/github/actions/workflow/status/dondai44423/donsetch/ci.yml?branch=master&logo=github&label=CI)](https://github.com/dondai44423/donsetch/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/axwfae/donsetch_noavx?style=flat&logo=github&color=e3b341)](https://github.com/axwfae/donsetch_noavx/stargazers)
+[![CI](https://img.shields.io/github/actions/workflow/status/axwfae/donsetch_noavx/ci.yml?branch=master&logo=github&label=CI)](https://github.com/axwfae/donsetch_noavx/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-ce422b?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-AGPL%203.0-2563eb)](LICENSE)
@@ -102,26 +130,15 @@ Four things no free (or paid) competitor has, plus a stack of agent-first mechan
 npm install -g donsetch
 ```
 
-Downloads the prebuilt binary for your platform from GitHub Releases with SHA256 verification. No build tools needed.
+Downloads the prebuilt Linux binary from GitHub Releases with SHA256 verification. No build tools needed. Pick the right one for your CPU — see the AVX warning at the top of this page.
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `donsetch-linux-x64.tar.gz` |
-| Linux arm64 | `donsetch-linux-arm64.tar.gz` |
-| macOS arm64 | `donsetch-darwin-arm64.tar.gz` |
-| Windows x86_64 | `donsetch-win32-x64.tar.gz` |
+| Linux x86_64 (AVX) | `donsetch-linux-x64.tar.gz` |
+| Linux x86_64 (**no AVX**) | `donsetch-linux-x64-noavx.tar.gz` |
 | Termux (Android) | Build from source (see build notes) |
 
-### Option 2 — Homebrew (macOS / Linux)
-
-```bash
-brew tap dondai44423/donsetch
-brew install donsetch
-```
-
-Installs the same official release binaries.
-
-### Option 3 — Pi agent (native extension)
+### Option 2 — Pi agent (native extension)
 
 ```bash
 pi install npm:donsetch
@@ -131,19 +148,19 @@ Installs DonSeTch as a native pi extension. The donsetch MCP binary spawns at se
 
 Update with `pi update --extensions` — both the binary and extension update together.
 
-### Option 4 — Build from source
+### Option 3 — Build from source
 
-| Dependency | Why | Linux | macOS | Windows |
-|---|---|---|---|---|
-| **Rust** | Build toolchain | `rustup` | `rustup` | `rustup` |
-| **Go** | BoringSSL build | `pacman -S go` / `apt install golang-go` | `brew install go` | `winget install GoLang.Go` |
-| **NASM** | BoringSSL assembly | `pacman -S nasm` / `apt install nasm` | `brew install nasm` | `choco install nasm` |
-| **CMake** | BoringSSL build | `pacman -S cmake` / `apt install cmake` | `brew install cmake` | `winget install cmake` |
-| **Clang** | bindgen (boring-sys) | `apt install clang libclang-dev` | *(bundled on macOS)* | `choco install llvm` |
-| **LLD** | PDFium link (aarch64) | `apt install lld` *(aarch64 only)* | — | — |
+| Dependency | Why | Linux |
+|---|---|---|
+| **Rust** | Build toolchain | `rustup` |
+| **Go** | BoringSSL build | `pacman -S go` / `apt install golang-go` |
+| **NASM** | BoringSSL assembly | `pacman -S nasm` / `apt install nasm` |
+| **CMake** | BoringSSL build | `pacman -S cmake` / `apt install cmake` |
+| **Clang** | bindgen (boring-sys) | `apt install clang libclang-dev` |
+| **LLD** | PDFium link (aarch64) | `apt install lld` *(aarch64 only)* |
 
 ```bash
-git clone https://github.com/dondai44423/donsetch.git
+git clone https://github.com/axwfae/donsetch_noavx.git
 cd donsetch
 cargo build --release
 ```
@@ -155,16 +172,72 @@ Binary lands at `target/release/donsetch`. First build takes ~2 min (compiling B
 
 - **BoringSSL** is vendored and built from source via `boring-sys`. First build compiles it (~2 min), then cached.
 - **PDFium** is downloaded as a static library by `build.rs` — no manual setup.
-- **ONNX Runtime** is downloaded at build time by `oar-ocr` (OCR) and `ort` (reranker) when those features are enabled.
+- **ONNX Runtime** is downloaded at build time by `oar-ocr` (OCR) and `ort` (reranker) when you enable `--features download-binaries`.
 - **Models** (OCR + reranker) download on first use to `~/.cache/donsetch/`, not bundled in the binary.
-- **Feature flags**: `default = []` — the core tool (fetch, search, crawl, PDF) works standalone. Build with `--features ocr,rerank` for OCR + semantic reranking (pulls in ONNX Runtime). The prebuilt npm binary ships with both features enabled.
-- **Chromium** (optional): needed for tier 2 browser escalation on bot-walled sites. Linux: `pacman -S chromium` / `apt install chromium-browser`. macOS: `brew install chromium`. Windows: Edge works. **Playwright**: if you already have `npx playwright install`, DonSeTch auto-discovers `~/.cache/ms-playwright/chromium-*/chrome-linux/chrome` — no manual `DONGHOST_CHROME` needed. **Ubuntu Snap**: set `DONGHOST_CHROME=/snap/chromium/current/usr/lib/chromium-browser/chrome` — the `/snap/bin/chromium` wrapper doesn't reliably pass CDP flags.
+- **Feature flags**: `default = []` — the core tool (fetch, search, crawl, PDF) works standalone. Build with `--features ocr,rerank,download-binaries` for OCR + semantic reranking (downloads prebuilt ONNX Runtime). The prebuilt npm binary ships with both features enabled. See "Build for CPUs without AVX" below for the `noavx` variant.
+- **Chromium** (optional): needed for tier 2 browser escalation on bot-walled sites. Linux: `pacman -S chromium` / `apt install chromium-browser`. **Playwright**: if you already have `npx playwright install`, DonSeTch auto-discovers `~/.cache/ms-playwright/chromium-*/chrome-linux/chrome` — no manual `DONGHOST_CHROME` needed. **Ubuntu Snap**: set `DONGHOST_CHROME=/snap/chromium/current/usr/lib/chromium-browser/chrome` — the `/snap/bin/chromium` wrapper doesn't reliably pass CDP flags.
 - **Linux Xvfb**: for headful Chrome on Linux, `xorg-server-xvfb` is needed (`apt install xvfb`). DonSeTch starts Xvfb automatically on `:99`. If your distro uses a regional Ubuntu Ports mirror that is down, fix it: `sudo sed -i 's|http://.*\.clouds\.ports\.ubuntu\.com|http://ports.ubuntu.com|' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update`.
-- **Linux ARM64 (aarch64)**: the default build (no features) works out of the box. Requires `lld` + `clang libclang-dev` for PDFium + boring-sys: `apt install lld clang libclang-dev` (fix mirror first if needed, see above). If you enable `--features ocr,rerank`, ONNX Runtime's C++ global constructors may deadlock at startup on aarch64.
+- **Linux ARM64 (aarch64)**: the default build (no features) works out of the box. Requires `lld` + `clang libclang-dev` for PDFium + boring-sys: `apt install lld clang libclang-dev` (fix mirror first if needed, see above). If you enable `--features ocr,rerank,download-binaries`, ONNX Runtime's C++ global constructors may deadlock at startup on aarch64.
 - **AppArmor / sandbox** (Ubuntu 23.10+): unprivileged user namespaces are disabled by default, so Chromium fails with `No usable sandbox!`. DonSeTch now passes `--no-sandbox --disable-setuid-sandbox` automatically — no manual fix needed.
 - **Termux (Android)**: `pkg install rust clang make pkg-config go lld && cargo build --release`. Chromium: `pkg install x11-repo && pkg install chromium`. DonSeTch auto-detects Termux and uses headless mode (no Xvfb needed). **boring-sys NDK workaround**: boring-sys's build script panics on Android targets without `ANDROID_NDK_HOME`. Run `export ANDROID_NDK_HOME=$PREFIX` before `cargo build` to satisfy the check (Termux IS the native Android environment, its toolchain lives in `$PREFIX`). PDFium uses bblanchon's Android shared library (`libpdfium.so`), not the glibc-targeted static archive.
 
+<details>
+<summary><b>Build for CPUs without AVX</b></summary>
+
+The prebuilt ONNX Runtime binaries used by `ocr`/`rerank` target **x86-64-v3**
+(AVX2+FMA) and crash with `SIGILL` on CPUs without AVX — Intel Bay Trail
+Atom/Celeron (N3540, J1900, ...), which only have SSE4.2.
+
+**Fast path (prebuilt)**: every GitHub Release also ships a
+`donsetch-linux-x64-noavx.tar.gz` artifact built by CI with AVX disabled.
+Download it from the release page and drop the `donsetch` binary into your
+`PATH` — no build tools needed.
+
+**Build path**: or build ONNX Runtime from source with AVX disabled and link
+it locally:
+
+```bash
+# 1) Compile ONNX Runtime without AVX (slow, ~30min-2h; can be done on any
+#    modern x86-64 machine and the result copied over).
+./scripts/build-onnxruntime-noavx.sh
+
+# 2) Build donsetch against it.
+export ORT_LIB_PATH="$PWD/vendor/onnxruntime-noavx/build"
+cargo build --release --features ocr,rerank,noavx
+```
+
+Notes:
+
+- The core tool (no features, `cargo build --release`) has **no** AVX
+  requirement at all — it runs on these CPUs as-is. `noavx` only matters
+  if you want OCR / semantic reranking.
+- `--features noavx` and `--features download-binaries` are mutually
+  exclusive in effect: enable exactly one of them (never both).
+- The build script also works when run on a faster machine — the produced
+  `libonnxruntime.a` is CPU-agnostic once AVX is disabled.
+
 </details>
+
+</details>
+
+---
+
+## 🧪 安装后：请先读 TESTING.md（重要）
+
+> **安装完成后的第一件事：阅读 [TESTING.md](TESTING.md)。**
+>
+> TESTING.md 整理了**完整的安装 → 验证 → 功能测试指引**，每一项都带
+> 可直接照抄的命令与**预期结果**（实测通过），包括：
+>
+> - 无 AVX CPU 上 noavx 版二进制的安装与 SHA256 校验
+> - `fetch` / `search` / `crawl`（含 resume 续爬）/ PDF OCR / MCP 的快速测试命令
+> - 已知限制（tier 2 浏览器、update/rollback、SSRF 防护等）
+>
+> 另外，**OCR 测试样张 `ocr-sample-scan.pdf`** 已保存在本目录（单页扫描样张，
+> 无文本层），可配合 TESTING.md 第 3.5 节进行 OCR 验证，无需上网另行找寻。
+>
+> 安装后按 TESTING.md 逐项执行即可，**无需重新摸索**，
+> 能大幅减少无用动作与重复排障。
 
 ---
 
@@ -628,7 +701,7 @@ DonSeTch is install and use. wigolo is install, download ~1.5 GB of models and b
 |---|---|
 | First build takes ~2 min | BoringSSL is compiled from source. Cached after that. |
 | Go is a build dependency | BoringSSL's build system is Go-based. You need Go even though DonSeTch is Rust. |
-| OCR/rerank not in default build | ONNX Runtime's C++ global constructors can deadlock on aarch64. Build with `--features ocr,rerank` to enable. The prebuilt npm binary ships with both. |
+| OCR/rerank not in default build | ONNX Runtime's C++ global constructors can deadlock on aarch64. Build with `--features ocr,rerank,download-binaries` to enable (or `--features ocr,rerank,noavx` with `ORT_LIB_PATH` on CPUs without AVX). The prebuilt npm binary ships with both. |
 | Interactive captchas not solved | hCaptcha, reCAPTCHA, Turnstile checkbox = honest dead end. No solving service by design. |
 | robots.txt ON by default for crawl | `respect_robots=true` for crawl. `fetch` doesn't check robots. |
 | Search rate-limits without a proxy | Keyless search scrapes public engines from your IP. Set `DONSEEK_PROXIES` for heavy use. |
@@ -650,7 +723,7 @@ DonSeTch is install and use. wigolo is install, download ~1.5 GB of models and b
 
 ## 🤝 Contributing
 
-PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Run `cargo clippy --features ocr,rerank -- -Dwarnings` and `cargo test --features ocr,rerank` before submitting. AGPL v3 — all contributions under the same license.
+PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Run `cargo clippy --features ocr,rerank,download-binaries -- -Dwarnings` and `cargo test --features ocr,rerank,download-binaries` before submitting. AGPL v3 — all contributions under the same license.
 
 ## 📄 License
 
@@ -662,8 +735,8 @@ Copyright (c) 2026 Bishesh Bhandari. AGPL-3.0 — see [LICENSE](LICENSE).
 
 ### If DonSeTch saves you time, ⭐ the repo
 
-[![Stars](https://img.shields.io/github/stars/dondai44423/donsetch?color=ff9f43&style=flat-square)](https://github.com/dondai44423/donsetch)
+[![Stars](https://img.shields.io/github/stars/axwfae/donsetch_noavx?color=ff9f43&style=flat-square)](https://github.com/axwfae/donsetch_noavx)
 
-**AGPL v3** · [Changelog](CHANGELOG.md) · [Issues](https://github.com/dondai44423/donsetch/issues) · [Releases](https://github.com/dondai44423/donsetch/releases)
+**AGPL v3** · [Changelog](CHANGELOG.md) · [Issues](https://github.com/axwfae/donsetch_noavx/issues) · [Releases](https://github.com/axwfae/donsetch_noavx/releases)
 
 </div>
