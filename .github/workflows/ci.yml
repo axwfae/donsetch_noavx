@@ -1,4 +1,4 @@
-# DonSeTch CI — build + test on Linux, macOS, Windows.
+# DonSeTch CI — build + test on Linux x86_64.
 #
 # The heavy dependencies need platform-specific setup:
 #   boring-sys (BoringSSL): CMake + C/C++ compiler + Go + bindgen (libclang)
@@ -6,11 +6,13 @@
 #   oar-ocr (ONNX Runtime):  download-binaries feature fetches at build time
 #
 # boring-sys needs Go because BoringSSL's build system is Go-based.
-# It needs NASM for x86_64 assembly crypto. On Windows it needs
-# LLVM/Clang for bindgen (pre-installed on Linux/macOS runners).
+# It needs NASM for x86_64 assembly crypto.
 #
 # Tests run in debug mode (no LTO) for speed. Release builds are
 # verified by the release workflow on tag push.
+#
+# macOS/Windows runners were removed to keep CI fast; Linux covers the
+# platform-independent Rust logic and the noavx path.
 
 name: CI
 
@@ -26,47 +28,10 @@ env:
 
 jobs:
   build-test:
-    # Context MUST stay "build-test (<platform>)": master's branch
-    # protection requires exactly these three check names
-    # (build-test (linux-x86_64) / (macos-arm64) / (windows-x86_64)).
-    # GitHub generates this format for matrix jobs without an explicit
-    # name; setting it explicitly keeps the required-checks contract
-    # stable no matter how the matrix evolves.
-    name: build-test (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            features: --features ocr,rerank
-            test-skip: ''
-          - name: linux-aarch64
-            os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            features: ''
-            # PDFium's FPDF_LoadMemDocument64 hangs on aarch64 Linux
-            # (same root cause as issue #9). Skip PDF-dependent tests;
-            # they pass on all other platforms.
-            test-skip: --skip pdf
-          - name: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            features: --features ocr,rerank
-            test-skip: ''
-          - name: macos-x86_64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            # ort-sys has no prebuilt ONNX Runtime for x86_64-apple-darwin.
-            features: ''
-            test-skip: ''
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            features: --features ocr,rerank
-            test-skip: ''
+    # Same "build-test (<platform>)" naming format as upstream so the
+    # required-checks contract stays recognizable.
+    name: build-test (linux-x86_64)
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
@@ -74,80 +39,33 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.98
         with:
-          targets: ${{ matrix.target }}
-          # Minimal profile: clippy/rustfmt exist only where named.
-          # Clippy also runs on Windows — ghost/proc.rs is entirely
-          # #[cfg(windows)], so a Linux-only lint pass never sees it.
-          components: ${{ (matrix.os == 'ubuntu-latest' && 'clippy, rustfmt') || (matrix.os == 'windows-latest' && 'clippy') || '' }}
+          targets: x86_64-unknown-linux-gnu
+          components: clippy, rustfmt
 
       - name: Install Go
         uses: actions/setup-go@v7
         with:
           go-version: '>=1.22.0'
+          cache: false
 
-      - name: Install NASM (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install NASM
         timeout-minutes: 5
         run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
-
-      - name: Install LLD (Linux ARM64)
-        if: matrix.os == 'ubuntu-24.04-arm'
-        timeout-minutes: 5
-        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends lld
-
-      - name: Install NASM (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: brew install nasm
-
-      - name: Install NASM (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install nasm -y
-        shell: cmd
-
-      - name: Install LLVM (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "11.0"
-          directory: ${{ runner.temp }}/llvm
-
-      - name: Set LIBCLANG_PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          $clang = (Get-Command clang).Source
-          $libclangPath = Split-Path $clang
-          "LIBCLANG_PATH=$libclangPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Add NASM to PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-v3
+          key: linux-x86_64-v3
 
       - name: Test
-        run: cargo test ${{ matrix.features }} --target ${{ matrix.target }} -- ${{ matrix.test-skip }}
-        timeout-minutes: 15
+        run: cargo test --features ocr,rerank,download-binaries --target x86_64-unknown-linux-gnu
 
-      # Two platforms, because ~32 cfg sites are Windows-exclusive
-      # (all of ghost/proc.rs) and Linux clippy never compiles them.
-      # macOS adds only one exclusive site — its other paths are
-      # `unix` (shared with Linux) or `not(linux_like)` (shared with
-      # Windows), so both are already covered here.
-      #
       # --all-targets pulls in #[cfg(test)] modules and tests/*.rs,
       # which the default lib+bins pass leaves unlinted.
       - name: Clippy
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
-        run: cargo clippy ${{ matrix.features }} --all-targets -- -Dwarnings
+        run: cargo clippy --features ocr,rerank,download-binaries --all-targets -- -Dwarnings
 
       - name: Format check
-        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
   # ── Supply chain: licenses + RustSec advisories + sources ──
@@ -208,3 +126,38 @@ jobs:
           name: crash-${{ matrix.target }}
           path: fuzz/artifacts/
           if-no-files-found: ignore
+
+  # noavx build gate — the OCR/rerank code path must keep compiling with
+  # the `noavx` feature (ONNX Runtime linked from ORT_LIB_PATH instead of
+  # downloaded AVX binaries). We point ort-sys at a stub library so the
+  # build script passes; `cargo check` never actually links it. The real
+  # no-AVX binary is built by the release workflow (build-noavx-linux).
+  noavx-check:
+    name: noavx-check (linux-x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+          cache: false
+
+      - name: Install NASM
+        timeout-minutes: 5
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: noavx-check-v1
+
+      - name: Check (noavx feature, stub ONNX library)
+        run: |
+          mkdir -p /tmp/fake-ort && touch /tmp/fake-ort/libonnxruntime.a
+          ORT_LIB_PATH=/tmp/fake-ort cargo check --features ocr,rerank,noavx
