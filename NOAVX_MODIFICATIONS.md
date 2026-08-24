@@ -49,8 +49,8 @@
 - publish job：`needs: [build, build-noavx-linux]`。
 - **port 3.2.0 的改進**：
   - `rust-toolchain@1.98`、build 加 `--locked`。
-  - Verify 步驟改為 `./donsetch --version` 並比對 `${GITHUB_REF_NAME#v}` 版本號（兩個 build job 都有）。
-  - 從 CHANGELOG.md 產生 RELEASE_BODY.md 的步驟 + `body_path: RELEASE_BODY.md`。
+  - Verify 步驟改為 `./donsetch --version` 並比對 `${GITHUB_REF_NAME#v}` 版本號（兩個 build job 都有）。**fork 修改**：tag 帶 `_sync` 後綴（如 `v3.2.0_sync`）時先剝除再比對（`${TAGVER%%_*}`），否則二進位檔回報的純版本號（3.2.0）永遠對不上。
+  - 從 CHANGELOG.md 產生 RELEASE_BODY.md 的步驟 + `body_path: RELEASE_BODY.md`。**fork 修改**：上游版找不到對應章節會 `sys.exit` 使 release 失敗；fork 的 `_sync` tag 在上游 CHANGELOG 永遠沒有章節，故改為「先找完整 tag、再退回基礎版號（`[3.2.0]`）、都沒有則寫入最小內容並繼續」，不再中斷發佈。
   - `actions/download-artifact@v8`。
 
 ### scripts/build-onnxruntime-noavx.sh
