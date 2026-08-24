@@ -1,0 +1,40 @@
+# DonSeTch private working docs + build artifacts
+status.md
+project.md
+
+# Private design blueprints — never public
+design/
+
+# Rust
+/target
+# Machine-specific cargo config (libclang/bindgen env — differs per OS)
+.cargo/
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Benchmarks (results + corpus are local, not committed)
+bench/results.json
+bench/results/
+bench/battle-corpus/
+
+# Vendored PDFium static libraries (build.rs auto-downloads)
+vendor/
+
+# PDF corpus binaries (download via scripts/download-corpus.sh)
+tests/pdf-corpus/*.pdf
+!tests/pdf-corpus/corpus.md
+
+# ONNX models (downloaded on first use, not bundled)
+*.onnx
+
+# Cache directories (local state)
+.cache/
+npm/binaries/
+bench/regression-results.json

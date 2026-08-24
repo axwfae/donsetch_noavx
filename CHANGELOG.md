@@ -5,7 +5,123 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.2.0] - 2026-08-23
+
+The search-legibility release: signals the merge already computed now reach the text channel, where every client can read them.
+
+### Changed
+
+- **Snippets are 200 chars, cut on a word boundary.** 120 ended mid-word almost every time — `sequence transduc`, `All You Nee`, `the attention ` on a live query. The cost was not lost context but a wasted `web_fetch` to learn what the snippet nearly said. The cut trims back rather than extending, so output stays bounded by the budget; if the character past the window is whitespace the window already ends cleanly and is kept whole; backing off is abandoned when it would cost more than a fifth of the budget, since a long URL or an unbroken CJK run would otherwise strip the snippet to nothing. The ellipsis is appended only when text was actually dropped, so it never promises content that does not exist. Trailing marks that join clauses (`, ; : 、 ， 「 《 【`) are removed before it; sentence terminators (`. ! ? 。！？`, shared codepoints across Chinese and Japanese) stay, because a cut landing after one means the snippet ended on a complete sentence. (#40, @Mart-Bogdan)
+- **Each result names the engines behind it**, with its blended score: `engines: bing, ddg · score: 0.83`. Which indexes agreed is what separates two equally plausible results — independent engines converging usually means canonical, a lone vertical hit often means tangential — and it was previously visible only in `structuredContent`. Names rather than a count: `consensus` there is `sources.len()`, which double-counts an engine that returned the URL at two ranks, while ranking counts index families. Deduped names are the honest version, and say *which* source. (#40, @Mart-Bogdan)
+
+### Fixed
+
+- **Whitespace in titles and snippets is collapsed at merge.** HTML-scraped engines normalized already; JSON-sourced hits did not — MDN summaries, BYOK provider snippets (Exa returns raw page text) and GitHub descriptions arrived with embedded newlines, breaking the three-space indent of the markdown list. Normalizing once in `rank::merge`, the single point every source flows through, also fixes the "longest snippet wins" and "shortest clean title wins" comparisons, which previously ranked on whitespace count: a newline-padded short snippet could beat a genuinely longer one. (#40, @Mart-Bogdan)
+- **Clippy only ever linted Linux, and only lib and bins.** The ~32 `#[cfg(windows)]` sites — all of `ghost/proc.rs` — were never compiled by the lint pass, and neither were the 50 `#[cfg(test)]` modules or `tests/*.rs`, which the default lib+bins pass skips. Clippy now runs on Windows as well, with `--all-targets`. macOS stays out deliberately: its only exclusive site is one `target_os = "macos"` block, everything else being `unix` (shared with Linux) or `not(linux_like)` (shared with Windows), so Linux+Windows already covers it.
+- **`rust-toolchain.toml` pins the local toolchain to 1.98**, matching the CI/release pin. v3.0.0 pinned the CI side to end local-vs-CI clippy drift, but nothing pinned the contributor's side, so a local clippy of a different version reports a different lint set — findings that CI does not have, and misses that it does.
+
+## [3.1.0] - 2026-08-23
+
+The focus release: the `focus` parameter rebuilt from flat BM25 block scoring to hierarchical section-aware scoring. Plus a homebrew tap URL fix.
+
+### Changed
+
+- **Section Gravity focus**: the `focus` parameter was rebuilt. The previous flat BM25 scoring treated every block in isolation: a heading match did not pull in its section, a body match did not pull in its heading, blocks were orphaned. Four mechanisms now replace it:
+  - **Section Gravity**: a heading match pulls in its entire section. The heading defines the topic; all content under it is relevant.
+  - **Inverse Gravity**: a body match pulls in its section heading. The agent needs the heading for context, never an orphaned block.
+  - **Breadcrumb Expansion**: for each kept block, all parent heading blocks from its path are added. Structural context is never lost.
+  - **Code Block Fission**: large code blocks (>2000 chars) are split into sub-blocks at logical boundaries (JSON top-level keys, blank-line sections) before scoring. A 38k JSON schema becomes scorable sub-blocks instead of one monolithic document.
+  - The body-only match threshold is now `>0` (any keyword appearance) instead of `max*0.15`. Never cut relevant info: noise costs tokens, cut info is unrecoverable.
+  - Fixed: focus on small pages no longer gets overridden by the raw-text fallback when the short content is intentional (the agent asked for a filtered slice, not a shell).
+
+### Fixed
+
+- Homebrew tap URLs included the version number in the asset filename (e.g. `donsetch-v3.0.0-darwin-arm64.tar.gz`) but the release workflow names assets without it (`donsetch-darwin-arm64.tar.gz`). This caused a 404 on `brew install donsetch`. (#38)
+
+## [3.0.0] - 2026-08-23
+
+The context-warfare release: six milestones — reference handles, budgets, probe and structure-first reading (M1); deadlines, real cancellation and ms-precision costs (M2); page fingerprints, deltas, Wayback resurrection and anti-cloak (M3); keyless domain adapters for reddit/npm/PyPI/crates/Go/RubyGems/GitHub/StackExchange/Wikipedia/docs frameworks (M4); search→fetch warm handoff, stitching and Chrome-parity TLS (M5); stable error codes, CI token/memory gates, a crash-only supervisor and the pi-agent v3 extension (M6). Plus a community fix for a Windows tier-1 boot hang (#36, @problaems).
+
+The context-warfare milestone (v3 M1): every tool now respects the agent's context window as the scarce resource it is.
+
+### Added
+
+- **Reference handles (`L1`, `S1`)**: fetched-page links render as `[text](L12)` instead of raw URLs, and search results list `S1`-`Sn` instead of 80-token URLs. `fetch` accepts a handle anywhere it accepts a URL (`fetch S3` = result 3 of your last search). Handles are stable per URL (L) or per search position (S), persisted at `~/.cache/donsetch/handles.json` with a 24h TTL and 2048-entry cap. Raw URLs remain in `structuredContent` for citation.
+- **Batch fetch with global token budget**: `url` now accepts an array (up to 12) — one parallel call instead of N round-trips. `budget_tokens` shares one output budget across all results, allocated by size (small pages stay whole, big ones slice with a resume note). Composed output carries per-URL status; only all-failed is an error.
+- **Probe mode (`must_contain`)**: verification questions ("does the changelog mention CVE-2026-XXXX?") resolve the page fully but collapse the output to MATCH/NO-MATCH plus up to three short context excerpts (~60 tokens instead of 4k). Case-insensitive substring or `/regex/`.
+- **TOC section IDs + sizes**: `toc=true` now renders `- [s3] Heading . 1.2k` — a stable per-section ID and content-size label. `section="s3"` targets by ID (heading-name matching still works). Read structure and cost before reading content.
+- **Dropped-content manifest**: when `focus` removes blocks, the output gains one accounting line (`dropped by focus: 256 blocks (~12.1k words) — History, Early years, ...`). Omission is audited, never silent.
+- **On-demand image OCR (`image_text=true`)**: fetches and OCRs the page's content images (up to 4, 5MB each, SSRF-guarded) and appends an `image text` section — infographics, comics and screenshot-locked pages become readable (the OCR engine ships with `--features ocr` builds; core builds say so honestly).
+- Fuzz targets (`fuzz/`): `extract`, `charset`, `paginate`, `sitemap`, `feed` — the five panic-surface parsers, wired as CI smoke jobs with crash-artifact upload. The crate grew a library target (`src/lib.rs`) to support this; the binary is unchanged behavior.
+- Supply-chain gate: `deny.toml` + cargo-deny CI job (advisories, licenses, bans, sources).
+- `bench/tokens.py`: token-efficiency bench asserting the invariants (focus >=40% savings, probe <=400 chars, no raw-URL leaks past handle rewriting).
+
+### Changed
+
+- **Main-content scoring**: link density now discounts punctuation/paragraph mass too (a sidebar of link lists could outrank the real article on punctuation inside link labels), image `alt` text counts as content text, and structural region IDs (`footer`, `bottom`, `sidebar`, `nav`, ...) are excluded from main-content candidacy at any size. xkcd scoped to its sidebar before this; it now scopes to the comic.
+- Media (`<img>`) elements are always segmented (cheap) and dropped at render time unless `media=true` — the image list must exist even when media lines are not rendered, so on-demand OCR works on any page.
+
+### Fixed
+
+- Comic/gallery pages (text-thin, image-rich) lost their content images when extraction fell back to raw text — fallbacks now carry the scoped image list through.
+- CI and release workflows pin rustc 1.98 (was floating `stable`), ending local-vs-CI clippy drift.
+### Added (M2 — the clock)
+
+- **Deadline contracts (`deadline_ms`)**: fetch (single and batch, per-URL) and search accept a hard time budget (500ms–600s). On expiry: honest `deadline` error with a next_action that names the usual eater (browser escalation) — never a silent hang.
+- **Real MCP cancellation**: `notifications/cancelled` now aborts in-flight work. Fetch/search drop via select (all persistent state was already written atomically); the crawl stops its workers gracefully through the existing stop-flag and persists its resume token — partial progress is never lost. Cancelled requests get no response, per spec.
+- **Progress notifications**: requests carrying `_meta.progressToken` get `notifications/progress` beats — per-page during crawls ("12 pages, 34 queued", throttled to 2s) and per-URL during batch fetches.
+- **Cost footer**: every fetch result's `[meta]` line and structuredContent carries `ms` — the agent sees what latency cost.
+- Crawl stop reason `Cancelled` with its own next_action ("resume with the token above").
+
+### Added (M3 — trust & memory)
+
+- **Page fingerprints + change verdicts**: every completed fetch is fingerprinted (sha256 of the normalized full markdown, first 12 hex) and recorded in a persistent page history (`~/.cache/donsetch/page-history.json`, capped: 64KB text per URL, 4MB total, 512 URLs). The next fetch of the same URL stamps its verdict in `[meta]` — `changed (minor|changed|rewritten)` with an ago-seconds label — so a re-read after a hot edit is an informed decision, not a guess.
+- **`since_last=true`**: collapses the fetch output to the verdict. Unchanged pages become one line ("unchanged since last fetch (300s ago) — fingerprint …"); changed pages return a section-level delta report (headings added/removed/changed, capped at 8) plus "refetch without since_last for full content". Re-watching a page costs ~30 tokens instead of 4k.
+- **Archive resurrection (`archive=auto|only|off`)**: on a dead link (404/410/gone), `auto` transparently checks the Wayback Machine and, if a snapshot exists, returns it stamped `ARCHIVED COPY of <url> — snapshot <date> (<age> old)` with an honest age warning when the snapshot is stale. `only` goes to the archive directly; `off` preserves the raw error. Dead links stop being dead ends.
+- **Anti-cloak equivalence check**: on domains known to serve decoy content to plain-HTTP clients (the wall registry), DonShadow's response is cross-checked against a headless render — text-similarity below the threshold appends a `decoy suspected` warning instead of confidently returning cloaked junk.
+- **Freshness truth**: `structuredContent.server_modified` surfaces the server's own `Last-Modified` on successful fetches — cache-lie detection for the agent ("the page says 2024, the server says 2019").
+- **Loud engine degradation**: search results from degraded engines carry a `*degraded: 3/5 engines ok (duckduckgo: timeout)*` line — silent quality collapse is visible in-band.
+- **Delta crawl (`since_last=true`)**: crawl skips pages whose recorded fingerprint is still fresh (24h window), reporting each as `unchanged (since_last)` in the skipped list — re-crawling a site after an edit returns just what moved.
+
+### Added (M4 — domain intelligence)
+
+A keyless adapter registry for the sites agents actually hit. Fetch-level rewrites route page URLs to the site's own public JSON APIs (one plain-HTTP request for structured truth — often skipping the wall entirely); extract-level adapters restructure HTML the generic pipeline mangles. Every result is honestly labeled `via=adapter:…` in `[meta]` and structuredContent; any adapter miss falls back to the generic path, and an adapter failure (rate limit, login wall, non-JSON 200) transparently retries the ORIGINAL url through the full pipeline. Kill switch: `DONSETCH_NO_ADAPTERS=1`.
+
+- **Reddit `.json`**: threads and subreddit listings fetched from the site's keyless JSON endpoints and rendered as comment trees with scores, ages, OP/sticky/NSFW flags and collapsed-reply counts; nested replies indented. Replaces the HTML scrape when available (an IP under Reddit's logged-out limit still gets the old.reddit/generic/ghost cascade).
+- **Package registries**: npm, PyPI, crates.io, Go module proxy and RubyGems page URLs (e.g. `npmjs.com/package/react`) resolve to their JSON APIs and render one unified package card — description, current version, publish/update dates, license, repo, download counts, dependencies, deprecation/`DEPRECATED` warnings, yanked markers, and a recent-versions list that prefers stable releases over canaries. Version-specific URLs fetch the version manifest (crates.io version pages carry the dependency tree).
+- **GitHub**: issue/PR lists, individual issues/PRs, releases and commits restructured from the server-rendered DOM (both the current React markup via stable `data-testid` hooks and the legacy markup). Issue lists: title, number, open/closed, author, date, labels. Issue threads: state, author, date, full body — plus an honest note that comments stream via JS (re-fetch with `tier=2` to read the discussion). No auth, no API rate jail.
+- **Stack Exchange**: question + answers as a QA tree with per-post scores (from `data-score`), accepted-answer ✓ marking, asker/answerer authorship and asked-dates.
+- **Wikipedia infoboxes**: the summary table (born/died/founded/license/versions…) becomes a clean `field | value` table at the top of the output, with the full article body (headings, paragraphs, data tables, lists) below — navbox/infobox duplication and citation markers stripped.
+- **Docs frameworks**: mkdocs / Docusaurus / Sphinx / Antora sites (detected via generator meta or framework markers) prepend a compact `Site outline` built from the nav — the site map with cheap L-handle links — before the page content. Version-switcher noise filtered.
+- `donsetch dev extract --url <url> --input <file>`: run the extraction pipeline on a saved HTML file against a URL (adapter development, fixture capture). `DONSETCH_ADAPTER_DUMP=<dir>` captures every body the adapters inspect.
+
+### Added (M5 — speed & stealth)
+
+- **Search→fetch warm handoff**: search enrichment already fetches the top results — that content is now cached (bounded: 10 bodies, 1.5MB each, 10min TTL) and the subsequent `web_fetch` of a result serves it instantly. `structuredContent.prewarmed_by_search: true`, tier reads `prewarmed` (the search→fetch second hop measured at ~3ms). One-shot: a second fetch goes to the wire for freshness; extraction, thin→ghost escalation and page history run unchanged on the cached body.
+- **Route hints on search results**: domains the self-improving store knows need the browser are annotated in the results (`⚠ needs browser (~+6s)`) — the agent can pick a faster source or budget time before spending the fetch.
+- **Article stitching (`stitch=true`)**: multi-page articles with rel=next pagination are walked (up to 6 parts, 48k budget, same-host only) and returned as ONE article with `*(part N)*` markers — an 8-part spread costs one call, not eight. `structuredContent.stitched` reports the part count.
+- **h2 fingerprint parity gate**: DonShadow's h2 preface (SETTINGS values+order, connection WINDOW_UPDATE, pseudo-header order, no PRIORITY frames) is now asserted byte-identical to the Chromium capture in a CI test — any future divergence is a red build, not a silent detectability regression.
+- **Locale-coherent Accept-Language**: the header now follows the target's locale (host TLD map + percent-encoded script in the path) — an en-US header on a .ru page gets the English stub on some sites and is a mild incoherence signal; localized sites now serve their real content. Default remains Chrome's en-US.
+
+### Fixed
+
+- **Daemon-abort panic in jsdata blob discovery (fuzzer find, CI fuzz gate)**: a known-global assignment (`__NUXT__ = `) matching at the very end of a page whose preceding byte was invalid UTF-8 (decoded to a 3-byte replacement char) advanced the scan cursor past the string / mid-character — `html[from..]` panicked. The cursor now floors to the next char boundary, clamped to the string length. Found by the new CI fuzz gate on its first green-config run; regression-tested with the crash input.
+- **Windows tier-1 boot hang in the browser version probe (#36, @problaems)**: startup spawned a real browser (`--version --headless=new`) with no timeout to learn its version — on Chrome 129 the spawn hangs (crash-looping GPU/network services) and blocks every command at boot, leaving an orphaned process tree. The probe now reads the version from the browser's own registry key (`HKCU\Software\<Browser>\BLBeacon\version` — zero spawns, honours `DONGHOST_CHROME` families incl. Thorium/Edge) and hard-caps any spawned fallback at 3s with a whole-tree kill. Review follow-ups: non-Windows build stub, child cleanup on an early-out path, unit tests for the version parser.
+
+### Added (M6 — foundation)
+
+- **Stable error codes**: every error on all three tools carries a machine-readable `code` (`guard.ssrf`, `deadline.hit`, `network.dns`, `wall.challenge`, `wall.paywall`, `content.binary`, `crawl.resume`, `archive.stale`, `cloak.suspected`, …) alongside the prose and `next_action` — agents branch on codes, not string matching.
+- **Token-efficiency CI gate**: the live claims (focus ≥40% savings, toc ≤5%, probe ≤2% of page, link rendering) are now asserted offline against saved real-page corpora on every build (`tests/token_invariants.rs`).
+- **Memory soak gate**: 200 full-pipeline extractions + 10k handle churn + 800 page-history records with RSS growth asserted bounded (`tests/soak.rs`) — a creeping daemon is a build failure, not a surprise.
+- **Crash-only supervisor**: `donsetch mcp --supervised` proxies stdio over a supervised child daemon — a panic-abort (or a SIGKILL) restarts the daemon (500ms backoff, 5-crash give-up), held requests are replayed, idle deaths are caught within 500ms, and the MCP session survives. Live-verified: SIGKILL mid-session, all requests answered after restart.
+- **Homebrew tap**: `brew tap dondai44423/donsetch && brew install donsetch` (formula staged, published with the release).
+- **Release workflow hardening**: release builds are `--locked` (deps can't drift mid-release); every platform binary must *report the tagged version* before packaging — a missed `Cargo.toml` bump fails the release job, not the user's `--version`; GitHub release notes are generated from `CHANGELOG.md` (curated) with commit-log notes appended, not the bare commit log.
+- **pi agent extension v3**: tools now run under the crash-only supervisor (`mcp --supervised` — a SIGKILLed daemon no longer kills the pi session); pi's Esc/cancel forwards real MCP cancellation so server-side fetch/crawl work actually stops; tool cards surface v3 stable error codes (`[deadline.hit] …`) and `stitched ×N` pagination. Tool definitions are discovered live from the binary, so `pi update --extensions` picks up all of v3 with no extension-side pinning.
+
+### Decision
+
+- **HTTP/3: not in 3.0.0** (timeboxed spike concluded — see design notes): h3 fingerprinting is not yet a vendor signal, h2 fallback is first-class everywhere, and a second transport stack (quiche + duplicate BoringSSL) pre-3.0 trades proven reliability for an unmeasured signal. The bar to ship post-3.0 is documented.
+
 
 ## [2.5.0] - 2026-08-22
 
