@@ -85,7 +85,9 @@ jobs:
             exit 1
           fi
           echo "OK: $(echo "$output" | head -1)"
-          TAGVER="${GITHUB_REF_NAME#v}"
+          # Fork tags carry a _sync suffix (e.g. v3.2.0_sync); the binary
+          # reports the plain Cargo.toml version, so compare base only.
+          TAGVER="${GITHUB_REF_NAME#v}"; TAGVER="${TAGVER%%_*}"
           if ! echo "$output" | grep -q "$TAGVER"; then
             echo "ERROR: binary does not report the tagged version $TAGVER"
             echo "Did you bump Cargo.toml before tagging?"
@@ -175,7 +177,9 @@ jobs:
             exit 1
           fi
           echo "OK: $(echo "$output" | head -1)"
-          TAGVER="${GITHUB_REF_NAME#v}"
+          # Fork tags carry a _sync suffix (e.g. v3.2.0_sync); the binary
+          # reports the plain Cargo.toml version, so compare base only.
+          TAGVER="${GITHUB_REF_NAME#v}"; TAGVER="${TAGVER%%_*}"
           if ! echo "$output" | grep -q "$TAGVER"; then
             echo "ERROR: binary does not report the tagged version $TAGVER"
             echo "Did you bump Cargo.toml before tagging?"
@@ -220,23 +224,36 @@ jobs:
       # CHANGELOG.md so the release page reads like the changelog,
       # not like a commit log. GitHub's auto-generated notes are
       # appended below it.
+      #
+      # Fork tags carry a _sync suffix (e.g. v3.2.0_sync) that never has
+      # an upstream CHANGELOG section — try the full tag first, then the
+      # base version ([3.2.0] for v3.2.0_sync), and degrade to a minimal
+      # body instead of failing the release if neither exists.
       - name: Build release notes from CHANGELOG
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           python3 - <<'EOF'
-          import os, re, sys
+          import os, re
           tag = os.environ["TAG_VERSION"].lstrip("v")
-          text = open("CHANGELOG.md", encoding="utf-8").read()
-          m = re.search(r"^## \[" + re.escape(tag) + r"\] - .*?$", text, re.M)
+          base = tag.split("_")[0]
+          text = ""
+          if os.path.exists("CHANGELOG.md"):
+              text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(r"^## \[" + re.escape(tag) + r"\] - .*?$", text, re.M) \
+              or re.search(r"^## \[" + re.escape(base) + r"\] - .*?$", text, re.M)
           if not m:
-              sys.exit(f"CHANGELOG.md has no [{tag}] section — add it before tagging")
-          start = m.end()
-          nxt = re.search(r"^## \[.*?\]", text[start:], re.M)
-          section = text[start:start + nxt.start()] if nxt else text[start:]
-          header = f"DonSeTch v{tag}\n\n"
-          open("RELEASE_BODY.md", "w", encoding="utf-8").write(header + section.strip() + "\n")
-          print(f"RELEASE_BODY.md: {len(section.splitlines())} lines from [{tag}]")
+              open("RELEASE_BODY.md", "w", encoding="utf-8").write(
+                  f"DonSeTch v{tag}\n\nNo CHANGELOG section for [{tag}].\n")
+              print(f"RELEASE_BODY.md: fallback — no CHANGELOG section for [{tag}]")
+          else:
+              start = m.end()
+              nxt = re.search(r"^## \[.*?\]", text[start:], re.M)
+              section = text[start:start + nxt.start()] if nxt else text[start:]
+              header = f"DonSeTch v{tag}\n\n"
+              open("RELEASE_BODY.md", "w", encoding="utf-8").write(header + section.strip() + "\n")
+              found = re.search(r"\[(.*?)]", m.group(0)).group(1)
+              print(f"RELEASE_BODY.md: {len(section.splitlines())} lines from [{found}]")
           EOF
 
       - name: Create GitHub Release
