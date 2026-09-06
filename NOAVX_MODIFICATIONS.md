@@ -69,7 +69,8 @@
 - **刻意保留**平台無關 jobs：`supply-chain`（cargo-deny）與 `fuzz`（5 個 target 的 90s smoke），原樣照搬（含 `actions/upload-artifact@v7`）。
 - `noavx-check` job 升級（舊 stub + `cargo check` 已不足）：
   - stub 改放 `vendor/onnx/libonnxruntime.so`（配合 build.rs 新路徑），`cargo check --features ocr,rerank,noavx` 保留作編譯門（check 不連結，stub 內容無所謂；**release 建置絕不可用 stub**）。
-  - 新增 QEMU 驗證：`qemu-x86_64 -cpu qemu64 ./donsetch doctor`（先清 avx 快取）+ `ocr-sample-scan.pdf` 真實 OCR smoke；rustflags `-C target-cpu=x86-64`（不可用 native）。
+  - 新增 QEMU 驗證：`qemu-x86_64 -cpu qemu64 ./donsetch doctor`（先清 avx 快取，斷言 "shared library loaded"）；rustflags `-C target-cpu=x86-64`（不可用 native）。
+  - **CI 不做 OCR smoke（用戶決策）**：樣張 `ocr-sample-scan.pdf` 留在 repo 供用戶自測；`fetch` 只接受公網 http(s)（本地路徑拒收、`127.0.0.1` 被 SSRF 攔截），CI 內無合適調用方式，故 release/ci 的 QEMU 段只保留 doctor 探針（dlopen + commit 即放行門）。
   - QEMU 段是 best-effort：runner 若無 QEMU 則跳過 run gate，CI 仍保證編譯門；權威的非 AVX 證明在 release.yml。
 
 ### github/workflows/release.yml
@@ -77,7 +78,7 @@
 - 附加 `build-noavx-linux` job：
   - 先跑腳本產出 `vendor/onnx/libonnxruntime.so`（快取 `vendor/onnxruntime-noavx` + `vendor/onnx`），再 `cargo build --release --features ocr,rerank,noavx`（`RUSTFLAGS="-C target-cpu=x86-64 -C link-arg=-fuse-ld=lld"`）；tarball 把 `libonnxruntime.so` 包進去，檔名 `donsetch-linux-x64-noavx.tar.gz`。
   - payload gate：binary size floor 保留；`.so` 的 floor **不可硬套標準版的 10MB**（自編體積不同）——改為存在性 + >1MB sanity + ELF 檢查，並加 TODO 註解要求首次發版後按實際體積校準。
-  - doctor 探針期望字串為 noavx 版的 "shared library loaded"；另有 glibc gate 與 QEMU doctor + OCR smoke（此 binary 的重點：不只啟動，還要在無 AVX 下真的 OCR 出文字）。
+  - doctor 探針期望字串為 noavx 版的 "shared library loaded"；另有 glibc gate。QEMU 段只跑 doctor 探針，不做 OCR smoke（同上：樣張供用戶自測，CI 不用）。
   - 此二進位同時相容有 AVX 與無 AVX 的 CPU——不確定時用 noavx 版就對了。
 - publish job：`needs: [build, build-noavx-linux]`。
 - **保留 _sync tag 容忍修復**（照抄 _320 版：版本驗證剝 `${TAGVER%%_*}` 後綴；release notes 三級降級不中斷——先找完整 tag，再退回基礎版號，再寫最小內容）。3.6.2 原版這兩處是硬失敗（`sys.exit`），必須改掉。
