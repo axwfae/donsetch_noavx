@@ -236,7 +236,17 @@ pub async fn run() {
 // ── Helpers ───────────────────────────────────────────────────
 
 /// Map (OS, ARCH) to the release asset name suffix.
+///
+/// Binaries built with the `noavx` feature (Bay Trail / non-AVX CPUs)
+/// must stay on the noavx asset: the standard linux-x64 tarball ships
+/// the official AVX-requiring .so and its binary keeps the AVX gate,
+/// so "updating" to it would silently kill OCR/rerank again.
 fn platform_asset_name() -> Option<&'static str> {
+    // cfg! is compile-time: true only in `noavx` builds, so standard
+    // builds are unaffected by this branch.
+    if cfg!(feature = "noavx") && std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64" {
+        return Some("linux-x64-noavx");
+    }
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("linux-x64"),
         ("linux", "aarch64") => Some("linux-arm64"),
