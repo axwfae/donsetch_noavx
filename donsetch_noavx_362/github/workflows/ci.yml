@@ -1,0 +1,271 @@
+# DonSeTch CI (noavx fork) — build + test on Linux x86_64.
+#
+# Test runs use cargo-nextest with the `ci` cargo profile (release
+# opts, no fat LTO), so full test links take seconds, not minutes.
+# Deploy target/ artifacts are cached per platform (rust-cache).
+#
+# Two payload gates beyond compilation, because compile success has
+# shipped dead binaries before (v3.3.0 ONNX feature leak):
+#   1. The onnx_payload_probe unit test runs inside the features-on
+#      suite (linux-x64 dynamic load) and fails if the ONNX
+#      environment cannot initialize.
+#   2. The noavx-check job below proves the `noavx` feature compiles
+#      AND runs under QEMU with no AVX (doctor probe: dlopen + commit
+#      of the self-built .so). No OCR smoke in CI — the sample PDF
+#      stays in the repo for end-user testing only.
+#
+# The heavy dependencies need platform-specific setup:
+#   boring-sys (BoringSSL): CMake + C/C++ compiler + Go + bindgen (libclang)
+#   PDFium (static):         curl + tar (build.rs downloads at build time)
+#   ONNX Runtime (.so):      build.rs downloads Microsoft's official
+#                            onnxruntime-linux-x64-1.24.2.tgz at build time
+#                            (standard build). The noavx build instead uses
+#                            a self-built no-AVX .so (see noavx-check).
+#
+# macOS/Windows runners were removed to keep CI fast; Linux covers the
+# platform-independent Rust logic and the noavx path (noavx is Linux-only).
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    # Same "build-test (<platform>)" naming format as upstream so the
+    # required-checks contract stays recognizable.
+    name: build-test (linux-x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: clippy, rustfmt
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+
+      - name: Install NASM
+        timeout-minutes: 5
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
+
+      # Cache key: <target>-dep-<DEP_HASH>-ci1.
+      # DEP_HASH hashes Cargo.lock + Cargo.toml with `version`
+      # lines stripped. That is the single most important line in
+      # this workflow: a release commit bumps the version in
+      # Cargo.toml, which under rust-cache's DEFAULT keying
+      # invalidates the whole dependency cache on every release
+      # and turns every tag build into a 15-25 min cold rebuild.
+      # With version stripped, releases build warm: only donsetch
+      # itself recompiles. Real dependency or profile changes still
+      # change the hash and invalidate correctly.
+      - name: Compute version-insensitive dep hash
+        shell: bash
+        run: |
+          DEP_HASH=$(python3 - <<'EOF'
+          import hashlib, pathlib, re
+          h = hashlib.sha256()
+          lock = pathlib.Path('Cargo.lock').read_text()
+          lock = re.sub(r'name = "donsetch"\nversion = "[^"]+"',
+                        'name = "donsetch"', lock)
+          h.update(lock.encode())
+          for p in sorted(pathlib.Path('.').rglob('Cargo.toml')):
+              t = re.sub(r'\n\s*version\s*=\s*"[^"]*"', '', p.read_text())
+              h.update(p.name.encode()); h.update(t.encode())
+          print(h.hexdigest()[:16])
+          EOF
+          )
+          echo "DEP_HASH=$DEP_HASH" >> "$GITHUB_ENV"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu-dep-${{ env.DEP_HASH }}-ci1
+          add-rust-environment-hash-key: "false"
+          # A red run must still warm the cache: the next push is
+          # right behind it and should not pay full price again.
+          cache-on-failure: "true"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Test (nextest)
+        run: cargo nextest run --profile ci --cargo-profile ci --features ocr,rerank,http --target x86_64-unknown-linux-gnu
+        timeout-minutes: 15
+
+      # --all-targets pulls in #[cfg(test)] modules and tests/*.rs,
+      # which the default lib+bins pass leaves unlinted.
+      # --profile ci reuses the test artifact graph (no recompile).
+      - name: Clippy
+        run: cargo clippy --profile ci --features ocr,rerank,http --all-targets -- -Dwarnings
+        timeout-minutes: 15
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  # ── Supply chain: licenses + RustSec advisories + sources ──
+  supply-chain:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Check advisories + licenses + bans + sources
+        run: cargo deny --all-features check --hide-inclusion-graph
+
+  # ── Fuzz smoke: short bursts on every master push keep the
+  # corpus warm and catch shallow panics before users do. Long
+  # runs happen locally (fuzz/README). Daemon aborts are the worst
+  # failure mode for an MCP server — this is the tripwire.
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [extract, charset, paginate, sitemap, feed]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          # -Zbuild-std needs rust-src. We fuzz the GNU target —
+          # boring-sys (BoringSSL C++) has no musl cross toolchain
+          # here and doesn't need one.
+          targets: x86_64-unknown-linux-gnu
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+      - name: Install build deps (boring-sys)
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y --no-install-recommends cmake nasm libclang-dev
+      - name: Fuzz (90s smoke)
+        working-directory: fuzz
+        run: |
+          mkdir -p corpus/${{ matrix.target }} artifacts/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -s none -- -max_total_time=90 -artifact_prefix=artifacts/${{ matrix.target }}/
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # noavx build + run gate — the OCR/rerank code path must keep working
+  # with the `noavx` feature (self-built no-AVX .so + compiled-out AVX
+  # gate). Two layers:
+  #   1. Compile gate (always runs): a stub vendor/onnx/libonnxruntime.so
+  #      satisfies build.rs's existence check, and
+  #      `cargo check --features ocr,rerank,noavx` proves the feature
+  #      combination compiles. `cargo check` never links the stub, so
+  #      its contents don't matter — but a *release* build must NEVER
+  #      use this stub (release.yml builds the real .so from source).
+  #   2. QEMU run gate (best-effort): build the real binary and run it
+  #      under qemu-x86_64 -cpu qemu64 (SSE2 only, no AVX) — `doctor`
+  #      must pass the ONNX probe. No OCR smoke in CI (the sample PDF
+  #      is for end-user testing). Without QEMU on the
+  #      runner this step skips and CI still guarantees the compile
+  #      gate above; the authoritative non-AVX proof then lives in
+  #      release.yml (build-noavx-linux), which always runs QEMU.
+  noavx-check:
+    name: noavx-check (linux-x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: clippy
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+
+      - name: Install NASM
+        timeout-minutes: 5
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
+
+      - name: Compute version-insensitive dep hash
+        shell: bash
+        run: |
+          DEP_HASH=$(python3 - <<'EOF'
+          import hashlib, pathlib, re
+          h = hashlib.sha256()
+          lock = pathlib.Path('Cargo.lock').read_text()
+          lock = re.sub(r'name = "donsetch"\nversion = "[^"]+"',
+                        'name = "donsetch"', lock)
+          h.update(lock.encode())
+          for p in sorted(pathlib.Path('.').rglob('Cargo.toml')):
+              t = re.sub(r'\n\s*version\s*=\s*"[^"]*"', '', p.read_text())
+              h.update(p.name.encode()); h.update(t.encode())
+          print(h.hexdigest()[:16])
+          EOF
+          )
+          echo "DEP_HASH=$DEP_HASH" >> "$GITHUB_ENV"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu-dep-${{ env.DEP_HASH }}-noavx-ci1
+          add-rust-environment-hash-key: "false"
+          cache-on-failure: "true"
+
+      - name: Check (noavx feature, stub ONNX library)
+        run: |
+          mkdir -p vendor/onnx && touch vendor/onnx/libonnxruntime.so
+          cargo check --features ocr,rerank,noavx --target x86_64-unknown-linux-gnu
+        timeout-minutes: 15
+
+      - name: QEMU non-AVX run (doctor probe)
+        shell: bash
+        run: |
+          # Best-effort: if qemu-user cannot be installed on this runner,
+          # skip — the compile gate above still holds, and release.yml
+          # runs this probe authoritatively.
+          # The sample PDF is for end-user testing, not CI: no OCR smoke
+          # here, the doctor probe (dlopen + commit on a non-AVX CPU) is
+          # the gate.
+          sudo apt-get install -y --no-install-recommends qemu-user >/dev/null 2>&1 || echo "no QEMU available, skipping run gate"
+          if ! command -v qemu-x86_64 >/dev/null 2>&1; then
+            echo "QEMU not installed: run gate skipped (compile gate still enforced)"
+            exit 0
+          fi
+          # Baseline ISA only: the noavx binary must not need AVX anywhere,
+          # including Rust codegen. Never use -C target-cpu=native here.
+          RUSTFLAGS="-C target-cpu=x86-64" cargo build --locked --features ocr,rerank,noavx --target x86_64-unknown-linux-gnu
+          cd target/x86_64-unknown-linux-gnu/debug
+          rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
+          qemu-x86_64 -cpu qemu64 ./donsetch doctor 2>&1 | tee /tmp/doctor-qemu.log
+          grep -q "ONNX Runtime" /tmp/doctor-qemu.log || { echo "QEMU doctor: no ONNX line found"; exit 1; }
+          echo "OK: noavx doctor probe passes on non-AVX CPU (QEMU qemu64)"
+        timeout-minutes: 30
