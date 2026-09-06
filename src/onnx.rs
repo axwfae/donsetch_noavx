@@ -212,9 +212,25 @@ fn load_and_init() -> Result<(), String> {
 
     // 2. Find the shared library.
     let lib_path = find_shared_lib().ok_or_else(|| {
-        "ONNX Runtime shared library not found. \
-            OCR and rerank are disabled."
-            .to_string()
+        // noavx builds: name the exact fix. Installers (human or AI)
+        // most often copy only the binary and leave this file behind —
+        // saying just "not found" has repeatedly cost a full re-test
+        // cycle (see NOAVX_MODIFICATIONS.md §3).
+        #[cfg(feature = "noavx")]
+        {
+            "ONNX Runtime shared library not found. OCR and rerank are disabled. \
+             Fix: libonnxruntime.so must sit NEXT TO the donsetch binary (same directory) \
+             or at ~/.cache/donsetch/onnx/libonnxruntime.so. Re-extract \
+             donsetch-linux-x64-noavx.tar.gz (it contains BOTH files) and copy both, \
+             then clear ~/.cache/donsetch/avx.json and re-run `donsetch doctor`."
+                .to_string()
+        }
+        #[cfg(not(feature = "noavx"))]
+        {
+            "ONNX Runtime shared library not found. \
+             OCR and rerank are disabled."
+                .to_string()
+        }
     })?;
 
     // 3. dlopen and init.

@@ -15,24 +15,33 @@
 # 确认 CPU 是否支持 AVX
 grep -m1 -o 'avx[0-9]*' /proc/cpuinfo   # 无输出 = 无 AVX，必须用 noavx 版
 
-# 下载 noavx 预编译二进制（以 v2.3.4_sync 为例）
+# 下载 noavx 预编译包及其校验文件（以 v3.6.2_sync 为例，请用 Releases 页最新版）
+TAG=v3.6.2_sync
 curl -sL -o donsetch-linux-x64-noavx.tar.gz \
-  "https://github.com/axwfae/donsetch_noavx/releases/download/v2.3.4_sync/donsetch-linux-x64-noavx.tar.gz"
+  "https://github.com/axwfae/donsetch_noavx/releases/download/${TAG}/donsetch-linux-x64-noavx.tar.gz"
+curl -sL -o donsetch-linux-x64-noavx.tar.gz.sha256 \
+  "https://github.com/axwfae/donsetch_noavx/releases/download/${TAG}/donsetch-linux-x64-noavx.tar.gz.sha256"
 
-# 校验 SHA256（与 .sha256 文件比对）
-sha256sum donsetch-linux-x64-noavx.tar.gz
+# 校验 SHA256（必须一致，不一致则停止并重新下载）
+sha256sum -c donsetch-linux-x64-noavx.tar.gz.sha256
 
-# 解压并安装到 PATH
+# 解压：包内必须有两个文件 donsetch + libonnxruntime.so，缺一不可
 tar -xzf donsetch-linux-x64-noavx.tar.gz
-chmod +x donsetch
-sudo cp donsetch /usr/local/bin/donsetch
+ls -la donsetch libonnxruntime.so
 
-# 验证
+# 安装：两个文件必须放在同一目录，缺 .so 则 OCR/rerank 全部失效
+chmod +x donsetch
+sudo cp donsetch libonnxruntime.so /usr/local/bin/
+
+# 验证（两项都必须通过）
 donsetch version
+rm -f ~/.cache/donsetch/avx.json
+donsetch doctor 2>&1 | grep -i "ONNX Runtime"
+# 预期：✓ ONNX Runtime ... shared library loaded
+# 若显示 shared library not found / missing：回到上一步确认 .so 是否与 binary 同目录
 ```
 
-> ⚠️ **禁止** `sudo donsetch update`：自更新会拉取标准 ABX 版二进制，
-> 在无 AVX CPU 上会立即 `SIGILL` 崩溃，破坏当前可用的 noavx 版本。
+> ⚠️ **旧版 `donsetch update` 禁止**：2026-09 前发布的 binary 其自更新逻辑不会安装 `.so`、且会抓错标准版资产，导致 OCR/rerank 失效。含修复的新版 `update` 会自动处理 `.so` 并锁定 noavx 资产；在确认运行版本已含修复前（`donsetch -v` 可区分），一律用上面的手动安装步骤。
 
 ---
 

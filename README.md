@@ -224,10 +224,30 @@ instead compiles ONNX Runtime from source with AVX disabled and compiles
 the AVX gate out, so OCR/rerank run on any x86-64 CPU.
 
 **Fast path (prebuilt)**: every GitHub Release also ships a
-`donsetch-linux-x64-noavx.tar.gz` artifact (binary + self-built
-`libonnxruntime.so`, keep them side by side). Download it from the
-release page — no build tools needed. It runs on **both** AVX and
-non-AVX CPUs; when in doubt, use `noavx`.
+`donsetch-linux-x64-noavx.tar.gz` artifact. It runs on **both** AVX and
+non-AVX CPUs; when in doubt, use `noavx`. No build tools needed —
+but **both files in the tarball must end up side by side**, otherwise
+OCR/rerank stay disabled with no other symptom:
+
+```bash
+TAG=v3.6.2_sync  # use the latest tag from the Releases page
+curl -sL -o donsetch-linux-x64-noavx.tar.gz \
+  "https://github.com/axwfae/donsetch_noavx/releases/download/${TAG}/donsetch-linux-x64-noavx.tar.gz"
+curl -sL -o donsetch-linux-x64-noavx.tar.gz.sha256 \
+  "https://github.com/axwfae/donsetch_noavx/releases/download/${TAG}/donsetch-linux-x64-noavx.tar.gz.sha256"
+sha256sum -c donsetch-linux-x64-noavx.tar.gz.sha256  # must say OK
+
+tar -xzf donsetch-linux-x64-noavx.tar.gz
+ls -la donsetch libonnxruntime.so  # both must exist
+chmod +x donsetch
+sudo cp donsetch libonnxruntime.so /usr/local/bin/
+
+rm -f ~/.cache/donsetch/avx.json
+donsetch doctor 2>&1 | grep -i "ONNX Runtime"
+# expected: ONNX Runtime ... shared library loaded
+# "shared library not found" means libonnxruntime.so is not next to
+# the binary — re-do the cp step above.
+```
 
 **Build path**: or build ONNX Runtime from source with AVX disabled and
 link it locally:

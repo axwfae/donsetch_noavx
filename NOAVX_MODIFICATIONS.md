@@ -84,6 +84,9 @@
 - **保留 _sync tag 容忍修復**（照抄 _320 版：版本驗證剝 `${TAGVER%%_*}` 後綴；release notes 三級降級不中斷——先找完整 tag，再退回基礎版號，再寫最小內容）。3.6.2 原版這兩處是硬失敗（`sys.exit`），必須改掉。
 
 ### README.md / CONTRIBUTING.md / TESTING.md
+- TESTING.md §1 安裝步驟曾是連續三次實測失敗的直接禍首：舊步驟只 `cp donsetch` 單檔，完全沒提 `.so`，AI 測試組照做注定缺件。已重寫為防呆版——TAG 變數 + `.sha256` 下載 + `sha256sum -c` 斷言 + `ls` 雙檔確認 + 雙檔同裝 + doctor ONNX 行斷言；`update` 警告同步更新（舊 binary 的 update 不裝 `.so` 且抓錯資產；新 binary 已修，見第 3 節）。
+- README「Build for CPUs without AVX」的 Fast path 同步改為帶預期輸出的編號步驟（下載→校驗→解壓雙檔確認→同裝→doctor 斷言；not found 即回頭重做 cp 步驟）。
+- `src/onnx.rs` 缺件報錯在 noavx 版加長為可執行指引（`#[cfg(feature = "noavx")]` 分支：指明兩個查找位 + 重解 tarball 取雙檔 + 清 avx.json + 跑 doctor），讓讀到 log 的安裝者（人或 AI）能自行修復，不再耗一輪重測。
 - TESTING.md、`ocr-sample-scan.pdf` 版本無關，直接沿用 _351 版（與 _320 版逐位元組相同）。
 - README 開頭加 AVX 警告區塊（照抄 _320/_351 文字）。
 - 下載表格改 Linux-only（含 noavx 列）；Homebrew 安裝選項移除（macOS 導向且指向上游 tap，本 fork 不出 macOS 二進位）。
