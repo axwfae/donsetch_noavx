@@ -121,6 +121,8 @@ const REPO: &str = "axwfae/donsetch_noavx";
 - `rollback`：Unix 分支在 binary 交換後，若 `.so` 與 `.so.bak` 並存則對調（保持 ONNX payload 與 binary 版本對應）。
 - 升級移植時這兩個檔案的重改**不可遺漏**（上游至今未修，屬上游 bug）。
 
+**第二根因（同次追加修復）：`update` 永遠只抓標準版資產**——`platform_asset_name()` 把 linux-x86_64 寫死為 `linux-x64`，noavx 用戶跑 `update` 會被標準版（AVX gate + 官方 AVX `.so`）覆蓋回來，OCR/rerank 再次失效。修復：`cfg!(feature = "noavx")` 且 Linux x86_64 時回傳 `linux-x64-noavx`（編譯期分支，標準版完全不受影響）。
+
 **附帶釐清**：noavx tarball 打包本身正確（含 `donsetch` + `libonnxruntime.so`），publish job 也會上架 noavx 資產，npm `install.js` 整包解開也正確——故障只發生在 `update` 路徑與手動單取 binary 的安裝方式。
 
 ## 4. 對照基準與驗證方式
