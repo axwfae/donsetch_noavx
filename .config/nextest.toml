@@ -1,0 +1,19 @@
+# cargo-nextest config: https://nexte.st/docs/configuration/
+#
+# The cargo profile is pinned on the command line
+# (`--cargo-profile ci`) in the Justfile and CI: some installed
+# nextest versions ignore the config-level cargo-profile key.
+#
+# Local: `cargo nextest run`           → fail-fast, stop at first red
+# CI:    `cargo nextest run --profile ci` → run everything, show all
+
+[profile.default]
+fail-fast = true
+
+[profile.ci]
+fail-fast = false
+# A hung test (native code deadlock inside PDFium/ONNX has
+# happened before on aarch64) must fail the job in a bounded
+# time, not wedge it until the workflow timeout. 30s per test
+# then hard-terminate.
+slow-timeout = { period = "30s", terminate-after = 1 }
