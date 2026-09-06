@@ -201,6 +201,11 @@ pub fn ensure_loaded() -> Result<(), String> {
 #[cfg(all(target_os = "linux", any(feature = "ocr", feature = "rerank")))]
 fn load_and_init() -> Result<(), String> {
     // 1. AVX gate (disk-cached, permanent if true).
+    // noavx builds ship a self-built libonnxruntime.so compiled without
+    // AVX (see scripts/build-onnxruntime-noavx.sh), so the gate is
+    // compiled out and OCR/rerank run on any x86-64 CPU. Standard builds
+    // keep the gate: the official Microsoft .so needs AVX.
+    #[cfg(not(feature = "noavx"))]
     if !crate::cpu::has_avx() {
         return Err(NO_AVX_MSG.to_string());
     }

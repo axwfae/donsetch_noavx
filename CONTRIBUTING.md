@@ -5,10 +5,10 @@ Thanks for your interest in contributing. DonSeTch is AGPL v3 — all contributi
 ## Build from source
 
 ```bash
-git clone https://github.com/dondai44423/donsetch.git
-cd donsetch
+git clone https://github.com/axwfae/donsetch_noavx.git
+cd donsetch_noavx
 cargo build --release                     # core build (fetch, search, crawl, PDF)
-cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking)
+cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking; auto-downloads the official ONNX .so, needs AVX)
 ```
 
 **Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#install) for platform-specific install commands.
@@ -21,7 +21,13 @@ cargo clippy --all-targets --features ocr,rerank -- -Dwarnings   # zero warnings
 cargo fmt --all -- --check    # formatting check
 ```
 
-All three must pass before a PR can merge. CI runs the same checks on Linux, macOS, and Windows.
+All three must pass before a PR can merge. CI runs the same checks on Linux x86_64 (this fork builds Linux only; noavx is Linux-only).
+
+CPUs without AVX: build ONNX Runtime from source first
+(`./scripts/build-onnxruntime-noavx.sh`, output at
+`vendor/onnx/libonnxruntime.so`), then
+`cargo build --release --features ocr,rerank,noavx` — see the README
+section "Build for CPUs without AVX".
 
 ## Commit conventions
 
@@ -73,7 +79,7 @@ DonSeTch is built from scratch — no dependency on existing OSS web tooling:
 2. Write tests for your change.
 3. Ensure `cargo test --features ocr,rerank`, `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings`, and `cargo fmt --check` all pass.
 4. Open a PR with a conventional commit title.
-5. CI must be green on all 3 platforms before merge.
+5. CI must be green on Linux before merge.
 
 ## Reporting issues
 

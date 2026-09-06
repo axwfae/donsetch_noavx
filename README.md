@@ -5,7 +5,7 @@
 **The web, for AI agents.**
 
 <div align="center">
-<a href="https://trendshift.io/repositories/163922?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-163922" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/163922/daily?language=Rust" alt="dondai44423%2Fdonsetch | Trendshift" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/163922?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-163922" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/163922/daily?language=Rust" alt="axwfae%2Fdonsetch_noavx | Trendshift" width="250" height="55"/></a>
 </div>
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5Y624N5RE)
@@ -16,11 +16,39 @@
 [![Tests](https://img.shields.io/badge/tests-766%20passed-00d4aa)](#)
 [![npm](https://img.shields.io/npm/v/donsetch?color=cb3837&logo=npm)](https://www.npmjs.com/package/donsetch)
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
-[![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/axwfae/donsetch_noavx?style=flat&logo=github&color=e3b341)](https://github.com/axwfae/donsetch_noavx/stargazers)
 
 [Install](#-install) · [Quickstart](#-quickstart) · [The 3 tools](#-the-3-tools) · [Chrome TLS](#-chrome-tls-not-chrome-like) · [Solve & Bounce](#-solve-and-bounce) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Benchmark](#-wrb-web-research-benchmark) · [Comparison](#-comparison) · [Gotchas](#-gotchas) · [Limits](#-honest-limits)
 
 </div>
+
+---
+
+> ## ⚠️ Before you install — check whether your CPU supports AVX
+>
+> DonSeTch's OCR and semantic reranking run on ONNX Runtime, and its prebuilt
+> binaries target **x86-64-v3 (AVX2 + FMA)**. On a CPU **without AVX** — e.g.
+> Intel Bay Trail Atom/Celeron (N3540, J1900, ...), which only has SSE4.2 —
+> that binary crashes instantly with `SIGILL`.
+>
+> **Always check your CPU first, then install the matching binary:**
+>
+> ```bash
+> grep -m1 -o 'avx[0-9]*' /proc/cpuinfo   # prints `avx`/`avx2` if supported, nothing if not
+> lscpu | grep -i avx                     # alternative
+> ```
+>
+> | Your CPU | Install this binary |
+> |---|---|
+> | ✅ Supports AVX/AVX2 | `donsetch-linux-x64.tar.gz` (or `npm install -g donsetch`) |
+> | ❌ No AVX (old / low-end) | **`donsetch-linux-x64-noavx.tar.gz`** — runs on both AVX and non-AVX CPUs |
+>
+> > **Special attention / 特別關注**
+> >
+> > - ❌ Standard binary on a no-AVX CPU → **instant `SIGILL` crash** (illegal instruction). No error message, no warning, nothing to diagnose.
+> > - ✅ The `noavx` binary works on **both** AVX and non-AVX CPUs — **when in doubt, use `noavx`.**
+> > - ✅ Only OCR and semantic reranking are affected. The core tool (fetch / search / crawl / PDF) has **no** AVX requirement at all.
+> > - 🔗 More details & the from-source build path: [Build for CPUs without AVX](#-install).
 
 ---
 
@@ -109,11 +137,13 @@ with SHA256 verification. No build tools needed. Linux prebuilts run
 on glibc >= 2.35 (Ubuntu 22.04 LTS and newer; the bundled ONNX lib
 keeps its own 2.27 floor, so OCR/rerank work on every one of those).
 
-**Homebrew (macOS/Linux):**
+Pick the right binary for your CPU — see the AVX warning at the top of
+this page:
 
-```bash
-brew tap dondai44423/donsetch && brew install donsetch
-```
+| Your CPU | Install this binary |
+|---|---|
+| ✅ Supports AVX/AVX2 | `donsetch-linux-x64.tar.gz` (or `npm install -g donsetch`) |
+| ❌ No AVX (old / low-end) | **`donsetch-linux-x64-noavx.tar.gz`** — runs on both AVX and non-AVX CPUs |
 
 **Pi agent (native extension):**
 
@@ -152,7 +182,7 @@ the config reference and update semantics.
 | **LLD** | PDFium link (aarch64) | `apt install lld` | not needed | not needed |
 
 ```bash
-git clone https://github.com/dondai44423/donsetch.git
+git clone https://github.com/axwfae/donsetch_noavx.git
 cd donsetch
 cargo build --release --features ocr,rerank,http
 ```
@@ -182,6 +212,49 @@ linux-arm64 and macOS-x64 are core-only (ONNX has no working prebuilt
 for those targets). Linux ARM64 has two honest limits: no OCR/rerank
 (the ONNX aarch64 prebuilt deadlocks at load) and fragile PDF (a
 loader hang in some paths, tracked in CI).
+
+<details>
+<summary><b>Build for CPUs without AVX</b></summary>
+
+The standard Linux build downloads Microsoft's official ONNX Runtime
+`.so` at compile time (`onnxruntime-linux-x64-1.24.2.tgz`, needs AVX)
+and gates OCR/rerank behind an AVX check — on a CPU without AVX those
+features stay disabled (the core tool still works). The `noavx` build
+instead compiles ONNX Runtime from source with AVX disabled and compiles
+the AVX gate out, so OCR/rerank run on any x86-64 CPU.
+
+**Fast path (prebuilt)**: every GitHub Release also ships a
+`donsetch-linux-x64-noavx.tar.gz` artifact (binary + self-built
+`libonnxruntime.so`, keep them side by side). Download it from the
+release page — no build tools needed. It runs on **both** AVX and
+non-AVX CPUs; when in doubt, use `noavx`.
+
+**Build path**: or build ONNX Runtime from source with AVX disabled and
+link it locally:
+
+```bash
+# 1) Compile ONNX Runtime without AVX as a shared lib (slow, ~30min-2h;
+#    can be done on any modern x86-64 machine and the .so copied over).
+#    Output lands at vendor/onnx/libonnxruntime.so, where build.rs picks
+#    it up automatically — no ORT_LIB_PATH needed.
+./scripts/build-onnxruntime-noavx.sh
+
+# 2) Build donsetch against it.
+cargo build --release --features ocr,rerank,noavx
+```
+
+Notes:
+
+- The core tool (no features, `cargo build --release`) has **no** AVX
+  requirement at all — it runs on these CPUs as-is. `noavx` only matters
+  if you want OCR / semantic reranking.
+- The standard build auto-downloads the official Microsoft `.so`; the
+  `noavx` build never downloads it and refuses to compile if
+  `vendor/onnx/libonnxruntime.so` is missing.
+- The produced `libonnxruntime.so` is CPU-agnostic once AVX is disabled —
+  the build script also works when run on a faster machine.
+
+</details>
 
 </details>
 
@@ -822,7 +895,7 @@ search speed, mainstream source authority, no-sitemap discovery.
 |---|---|
 | First build ~2 min | BoringSSL compiles from source. Cached after. |
 | Go is a build dependency | BoringSSL's build system is Go-based. |
-| OCR/rerank not in default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. npm prebuilt ships them on linux-x64, macOS-arm64, Windows-x64. |
+| OCR/rerank not in default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. The standard Linux build auto-downloads the official Microsoft `.so` (needs AVX); on CPUs without AVX use the `noavx` binary or build with `--features ocr,rerank,noavx` after running `scripts/build-onnxruntime-noavx.sh` (see "Build for CPUs without AVX"). npm prebuilt ships them on linux-x64, macOS-arm64, Windows-x64. |
 | First OCR/search downloads models | ~24MB reranker, ~37MB OCR, on first use, cached forever. Pre-seed offline boxes by copying the `ocr`/`rerank` cache dirs. |
 | Captchas need Bright Data Web Unlocker | hCaptcha, reCAPTCHA and Turnstile cannot be solved locally, by design. With an unlocker key (`donsetch keys add unlocker <key>[::zone]`), fetch falls back to Bright Data Web Unlocker and captcha-walled pages come through rendered. No key = a clear honest error, never a hang. (Bright Data sign-up link is an affiliate link.) |
 | robots.txt ON for crawl | `respect_robots=true` for crawl; `fetch` doesn't check. |
@@ -894,8 +967,8 @@ Copyright (c) 2026 Bishesh Bhandari. AGPL-3.0, see [LICENSE](LICENSE).
 
 ### If DonSeTch saves you time, ⭐ the repo
 
-[![Stars](https://img.shields.io/github/stars/dondai44423/donsetch?color=ff9f43&style=flat-square)](https://github.com/dondai44423/donsetch)
+[![Stars](https://img.shields.io/github/stars/axwfae/donsetch_noavx?color=ff9f43&style=flat-square)](https://github.com/axwfae/donsetch_noavx)
 
-**AGPL v3** · [Changelog](CHANGELOG.md) · [Issues](https://github.com/dondai44423/donsetch/issues) · [Releases](https://github.com/dondai44423/donsetch/releases)
+**AGPL v3** · [Changelog](CHANGELOG.md) · [Issues](https://github.com/axwfae/donsetch_noavx/issues) · [Releases](https://github.com/axwfae/donsetch_noavx/releases)
 
 </div>

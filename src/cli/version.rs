@@ -9,7 +9,7 @@ use crate::cli;
 use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
 
-const REPO: &str = "dondai44423/donsetch";
+const REPO: &str = "axwfae/donsetch_noavx";
 
 pub async fn run() {
     crate::cli::init();

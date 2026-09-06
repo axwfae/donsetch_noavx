@@ -770,29 +770,42 @@ fn check_onnx() -> CheckResult {
         }
         #[cfg(target_os = "linux")]
         {
-            // Check AVX support (disk-cached).
-            let has_avx = crate::cpu::has_avx();
-            if !has_avx {
-                return CheckResult::Warn(
-                    "CPU lacks AVX : OCR and rerank disabled (all other features work)".into(),
-                );
-            }
-            // Check shared library presence.
-            let lib_name = "libonnxruntime.so";
-            let found = if let Ok(exe) = std::env::current_exe()
-                && let Some(parent) = exe.parent()
+            // noavx builds ship a self-built .so without AVX, so there is
+            // no AVX gate to check: probe the real thing (dlopen + commit)
+            // via ensure_loaded() and report Pass/Fail directly.
+            #[cfg(feature = "noavx")]
             {
-                parent.join(lib_name).exists()
-            } else {
-                false
-            };
-            let cache = paths::cache_dir().join("onnx").join(lib_name).exists();
-            if found || cache {
-                CheckResult::Pass("AVX detected, shared library present".into())
-            } else {
-                CheckResult::Warn(
-                    "AVX detected but shared library missing : reinstall donsetch".into(),
-                )
+                match crate::onnx::ensure_loaded() {
+                    Ok(()) => CheckResult::Pass("noavx build, shared library loaded".into()),
+                    Err(e) => CheckResult::Fail("ONNX payload probe failed".into(), e.to_string()),
+                }
+            }
+            #[cfg(not(feature = "noavx"))]
+            {
+                // Check AVX support (disk-cached).
+                let has_avx = crate::cpu::has_avx();
+                if !has_avx {
+                    return CheckResult::Warn(
+                        "CPU lacks AVX : OCR and rerank disabled (all other features work)".into(),
+                    );
+                }
+                // Check shared library presence.
+                let lib_name = "libonnxruntime.so";
+                let found = if let Ok(exe) = std::env::current_exe()
+                    && let Some(parent) = exe.parent()
+                {
+                    parent.join(lib_name).exists()
+                } else {
+                    false
+                };
+                let cache = paths::cache_dir().join("onnx").join(lib_name).exists();
+                if found || cache {
+                    CheckResult::Pass("AVX detected, shared library present".into())
+                } else {
+                    CheckResult::Warn(
+                        "AVX detected but shared library missing : reinstall donsetch".into(),
+                    )
+                }
             }
         }
     }

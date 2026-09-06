@@ -278,7 +278,46 @@ fn main() {
     let has_onnx =
         env::var_os("CARGO_FEATURE_OCR").is_some() || env::var_os("CARGO_FEATURE_RERANK").is_some();
     if has_onnx {
-        if let Some(info) = onnx_target_info(&os, &arch) {
+        if env::var_os("CARGO_FEATURE_NOAVX").is_some() {
+            // noavx: never download the official Microsoft .so. The
+            // self-built no-AVX libonnxruntime.so must already exist at
+            // vendor/onnx/libonnxruntime.so (produced by
+            // scripts/build-onnxruntime-noavx.sh) — the same path
+            // fetch_onnx_prebuilt uses, so its early-return logic below
+            // applies as-is. Missing file is a hard error pointing at
+            // the script. On non-Linux targets warn and ignore (macOS /
+            // Windows use the static leg, where noavx is meaningless).
+            if os == "linux" && arch == "x86_64" {
+                let vendored = manifest.join("vendor").join("onnx");
+                let shared_path = vendored.join("libonnxruntime.so");
+                if !shared_path.exists() {
+                    panic!(
+                        "donsetch: `noavx` is enabled but {} is missing.\n\
+                         Build it first with scripts/build-onnxruntime-noavx.sh, then rebuild with \
+                         `--features ocr,rerank,noavx`. The official Microsoft .so is never \
+                         downloaded for noavx builds.",
+                        shared_path.display()
+                    );
+                }
+                eprintln!(
+                    "donsetch build: noavx — using self-built {} (no AVX required).",
+                    shared_path.display()
+                );
+                copy_onnx_shared_lib(&shared_path);
+            } else {
+                eprintln!(
+                    "warning: donsetch: `noavx` is Linux x86_64-only; ignoring it on {os}-{arch} \
+                     (macOS/Windows use static linking)."
+                );
+                if let Some(info) = onnx_target_info(&os, &arch) {
+                    fetch_onnx_prebuilt(info, &manifest);
+                } else {
+                    eprintln!(
+                        "donsetch build: OCR/rerank enabled, ort static link for {os}-{arch}"
+                    );
+                }
+            }
+        } else if let Some(info) = onnx_target_info(&os, &arch) {
             // Linux x86_64: build shared lib for dynamic loading.
             fetch_onnx_prebuilt(info, &manifest);
         } else {
@@ -335,6 +374,9 @@ fn main() {
     }
     if env::var_os("CARGO_FEATURE_RERANK").is_some() {
         feats.push("rerank");
+    }
+    if env::var_os("CARGO_FEATURE_NOAVX").is_some() {
+        feats.push("noavx");
     }
     let feats_display = if feats.is_empty() {
         "(none)".to_string()
