@@ -7,7 +7,9 @@
 //!
 //! Cross-platform:
 //!   Unix:   atomic rename swap. The running process keeps its
-//!           inode open.
+//!           inode open. Also swaps libonnxruntime.so with its
+//!           .bak when both exist (keeps the ONNX payload matched
+//!           to the running binary).
 //!   Windows: rename running .exe to .bak, copy old .bak to .exe.
 //!           Also swaps pdfium.dll if a .dll.bak exists.
 
@@ -153,6 +155,23 @@ pub fn run() {
                 println!("    Try: sudo donsetch --rollback");
             }
             std::process::exit(1);
+        }
+
+        // Swap libonnxruntime.so with its backup (mirrors the update
+        // install step above and the Windows pdfium.dll swap below :
+        // keeps the ONNX payload matched to the running binary).
+        let so_path = exe_dir.join("libonnxruntime.so");
+        let so_bak = exe_dir.join("libonnxruntime.so.bak");
+        if so_bak.exists() && so_path.exists() {
+            let so_tmp = exe_dir.join(".libonnxruntime.rollback.tmp");
+            let _ = std::fs::remove_file(&so_tmp);
+            if std::fs::rename(&so_path, &so_tmp).is_ok() {
+                if std::fs::copy(&so_bak, &so_path).is_ok() {
+                    let _ = std::fs::rename(&so_tmp, &so_bak);
+                } else {
+                    let _ = std::fs::rename(&so_tmp, &so_path);
+                }
+            }
         }
     }
 

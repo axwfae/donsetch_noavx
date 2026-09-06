@@ -14,7 +14,8 @@
 //!   4. Verify SHA256.
 //!   5. Extract (flate2 + tar).
 //!   6. Replace the binary in place (atomic on Unix, rename-then-
-//!      write on Windows). Also replaces pdfium.dll on Windows.
+//!      write on Windows). Also installs libonnxruntime.so on Unix
+//!      and replaces pdfium.dll on Windows when the tarball has them.
 //!   7. Clean up temp files and old backups.
 
 use std::path::Path;
@@ -387,6 +388,26 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
             let _ = std::fs::remove_file(&tmp);
             format!("rename: {e}")
         })?;
+
+        // Install libonnxruntime.so if the tarball includes it (Linux
+        // load-dynamic builds ship it beside the binary since 3.5.1).
+        // Without this step `update` leaves the new binary with no ONNX
+        // payload and OCR/rerank silently stop working.
+        let new_so = temp_dir.join("libonnxruntime.so");
+        if new_so.exists() {
+            let so_path = exe_dir.join("libonnxruntime.so");
+            let so_bak = exe_dir.join("libonnxruntime.so.bak");
+            let _ = std::fs::remove_file(&so_bak);
+            if so_path.exists() {
+                let _ = std::fs::rename(&so_path, &so_bak);
+            }
+            if let Err(e) = std::fs::copy(&new_so, &so_path) {
+                println!(
+                    "  {} Warning: ONNX library install failed ({e}) : OCR/rerank will be disabled until libonnxruntime.so is placed beside the binary",
+                    cli::icon_warn()
+                );
+            }
+        }
     }
 
     #[cfg(windows)]
