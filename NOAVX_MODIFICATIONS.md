@@ -10,7 +10,7 @@
 
 **為什麼存在**：donsetch 的 OCR / 語意 rerank 功能依賴 ONNX Runtime。3.6.2 的 Linux 標準建置在編譯期下載微軟官方 `onnxruntime-linux-x64-1.24.2.tgz` 的 `.so` 隨 binary 出貨，runtime 經 `src/onnx.rs::ensure_loaded()` 先過 AVX gate 再 dlopen。在沒有 AVX 的老 CPU 上（Intel Bay Trail Atom/Celeron N3540、J1900 等，只有 SSE4.2）標準版的 OCR/rerank 被 gate 擋下（程式本身正常跑，不再 SIGILL——SIGILL 時代已隨 load-dynamic 結束）。本目錄的所有修改都是為了讓 OCR/rerank 在無 AVX CPU 上真正可用：出貨自編的無 AVX `.so`，並把 AVX gate 編譯掉。
 
-**目錄定位**：本目錄只攜帶 noavx 建置設定、CI workflow、文件，以及 **`src/` 中「有修改」的檔案**（共 5 個：`src/cli/{update,version,status}.rs`、`src/cli/doctor.rs`、`src/onnx.rs`，見第 3 節）。未修改的原始碼一律不同步進來，以免與基礎版產生干擾——建置時把本目錄疊在 `donsetch-3.6.2` 原始碼樹上使用。升級版本時需重新套用這些檔案修改（見第 5 節）。
+**目錄定位**：本目錄只攜帶 noavx 建置設定、CI workflow、文件，以及 **`src/` 中「有修改」的檔案**（共 6 個：`src/cli/{update,version,status,rollback}.rs`、`src/cli/doctor.rs`、`src/onnx.rs`，見第 3 節）。未修改的原始碼一律不同步進來，以免與基礎版產生干擾——建置時把本目錄疊在 `donsetch-3.6.2` 原始碼樹上使用。升級版本時需重新套用這些檔案修改（見第 5 節）。
 
 **鏡像目錄**：2.x 時代上游同時維護 `.github/workflows/` 與 `github/workflows/` 兩處（歷史因素）；3.2.0 起上游已移除 `github/` 鏡像。**3.5.1 起上游連 `.github/` 都沒有（3.6.2 相同，已確認無 `.github/` 目錄），workflows 只剩頂層 `github/workflows/`，故本目錄僅保留 `github/workflows/`，不做任何鏡像。**
 
@@ -95,7 +95,7 @@
 
 ## 3. 更新來源（update 指令）指向 fork
 
-**修改位置：`src/cli/{update.rs,version.rs,status.rs}` 三個檔案的 `REPO` 常數**（本目錄的 `src/` 另有 `cli/doctor.rs` 與 `src/onnx.rs`，見第 2 節）
+**修改位置：`src/cli/{update.rs,version.rs,status.rs}` 三個檔案的 `REPO` 常數**（本目錄的 `src/` 另有 `cli/doctor.rs`、`cli/rollback.rs` 與 `src/onnx.rs`，見第 2 節與下文）
 
 ```rust
 // 原：const REPO: &str = "dondai44423/donsetch";
@@ -110,6 +110,19 @@ const REPO: &str = "axwfae/donsetch_noavx";
 
 **fork Release 格式需求**：tag 為 `v3.x.x`（`_sync` 後綴允許，如 `v3.6.2_sync`），資產名稱 `donsetch-linux-x64.tar.gz`（+ `.sha256`）與 `donsetch-linux-x64-noavx.tar.gz`——本目錄的 release workflow 產出的正是這些名稱。
 
+### update / rollback 必須安裝/交換 `libonnxruntime.so`（3.6.2 實測故障後追加）
+
+**故障現象**：3.6.2 noavx 包在實機測試中 OCR 與 rerank 雙雙失效（`find_shared_lib()` 找不到 `.so`），判定測試失敗、退回 3.2.0。
+
+**根因**：3.5.1 切到 load-dynamic 後 tarball 內容從「單一 binary」變成「binary + `.so`」，但上游 `update` 指令沒跟著升級——`src/cli/update.rs::replace_binary()` 在 Unix 只換 binary 本體（Windows 才順手處理 pdfium.dll），完全不管 `libonnxruntime.so`。因此任何經 `donsetch update` 升級的安裝，`.so` 都缺失（若用戶手動解包只取 binary 同理），OCR/rerank 靜默停用。`rollback` 同理不處理 `.so`。
+
+**修復**（本目錄 `src/cli/update.rs`、`src/cli/rollback.rs`，仿 Windows 的 pdfium.dll 模式）：
+- `update`：Unix 分支在 atomic replace 之後，若 tarball 含 `libonnxruntime.so` 則備份舊檔為 `.so.bak` 並裝入新檔；失敗只警告（不斷中更新，binary 本體優先）。
+- `rollback`：Unix 分支在 binary 交換後，若 `.so` 與 `.so.bak` 並存則對調（保持 ONNX payload 與 binary 版本對應）。
+- 升級移植時這兩個檔案的重改**不可遺漏**（上游至今未修，屬上游 bug）。
+
+**附帶釐清**：noavx tarball 打包本身正確（含 `donsetch` + `libonnxruntime.so`），publish job 也會上架 noavx 資產，npm `install.js` 整包解開也正確——故障只發生在 `update` 路徑與手動單取 binary 的安裝方式。
+
 ## 4. 對照基準與驗證方式
 
 - 對照組：`donsetch_noavx_351/`（3.5.1 的 noavx 變體）、`donsetch-3.6.2/`（乾淨的上游版）。事前驗證：3.6.2 與 3.5.1 在 noavx 相關程式碼上幾乎完全相同——`build.rs`、`src/onnx.rs`、`src/cli/{update,version,status}.rs`、`src/cpu.rs`、`github/workflows/ci.yml`、`github/workflows/release.yml` 逐位元組相同；`check_onnx()` 函數本體逐位元組相同（僅行號位移）；`Cargo.toml` 僅差版本號 + axum/tower-http/base64 bump；`README.md`、`CONTRIBUTING.md` 有內容漂移（dsh 新段落、Reviewers 段、doctor 新檢查函數、Gotchas/login 新列）。
@@ -120,7 +133,7 @@ const REPO: &str = "axwfae/donsetch_noavx";
   python3 -c "import yaml; yaml.safe_load(open('donsetch_noavx_362/github/workflows/ci.yml'))"
   python3 -c "import yaml; yaml.safe_load(open('donsetch_noavx_362/github/workflows/release.yml'))"
   grep -rn "dondai44423" donsetch_noavx_362/   # 應只剩 README 的 wrb 段與 dsh 段、CONTRIBUTING 的 Reviewers 表格（見未解決疑點）與本文件記錄原始值處
-  find donsetch_noavx_362/src -type f          # 必須恰好 5 個檔案
+  find donsetch_noavx_362/src -type f          # 必須恰好 6 個檔案
   diff donsetch_noavx_362/src/onnx.rs donsetch-3.6.2/src/onnx.rs   # 唯一差異為 gate 的 cfg 包裝+註解
   grep -n "download-binaries\|simd" donsetch_noavx_362/Cargo.toml  # oar-ocr 保持原樣（含 simd）
   ```
@@ -133,7 +146,7 @@ const REPO: &str = "axwfae/donsetch_noavx";
 2. 版本無關檔案直接複製：`TESTING.md`、`ocr-sample-scan.pdf`、`scripts/build-onnxruntime-noavx.sh`（若新版仍是 load-dynamic 架構；若上游改回靜態連結，需重新評估整套設計）。
 3. 其餘檔案從新版原始目錄複製後，按第 2 節逐項套用修改（**不可盲目 patch**，README/build.rs 各版有內容漂移，要找對應段落做等價編輯；先確認新版 `github/` vs `.github/` 佈局；`doctor.rs` 若上游在 `check_onnx` 之外加了新函數，必須等價編輯、不可整檔複製舊版——見第 2 節移植注意）。
 4. workflows 以本目錄版本為範本，但 port 新版的 action 版本升級與 apt 改進；上游平台無關的新 jobs（如 supply-chain/fuzz）原樣保留。
-5. **重改新版 `src/cli/{update,version,status}.rs` 的 `REPO` 常數、重包 `src/onnx.rs` 的 gate、新版 `check_onnx` 重加 cfg 分支後，只同步這 5 個修改過的檔案**至新目錄的 `src/`（保持相對路徑；新版原始檔帶上游值；未修改的 src 檔案一律不同步，見第 1 節）。
+5. **重改新版 `src/cli/{update,version,status}.rs` 的 `REPO` 常數、重包 `src/onnx.rs` 的 gate、新版 `check_onnx` 重加 cfg 分支、重加 `update.rs`/`rollback.rs` 的 `.so` 安裝/交換邏輯（見第 3 節）後，只同步這 6 個修改過的檔案**至新目錄的 `src/`（保持相對路徑；新版原始檔帶上游值；未修改的 src 檔案一律不同步，見第 1 節）。
 6. 跑第 4 節的驗證指令。
 
 ## 6. 已定案事項
