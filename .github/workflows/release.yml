@@ -1,15 +1,24 @@
-# DonSeTch Release — build prebuilt binaries for Linux, macOS, Windows.
+# DonSeTch Release (noavx fork) — build prebuilt Linux binaries.
 #
-# Triggers on tag push (v*). Builds release binaries on 3 platforms,
+# Triggers on tag push (v*). Builds release binaries on Linux x86_64,
 # packages them with SHA256 checksums, and creates a draft GitHub
 # release with all artifacts attached.
 #
 # Artifact naming (npm-compatible for the npm wrapper package):
-#   donsetch-linux-x64.tar.gz       (Linux x86_64)
-#   donsetch-linux-arm64.tar.gz     (Linux ARM64 / aarch64)
-#   donsetch-darwin-arm64.tar.gz    (macOS arm64)
-#   donsetch-darwin-x64.tar.gz      (macOS Intel)
-#   donsetch-win32-x64.tar.gz       (Windows x86_64 + pdfium.dll)
+#   donsetch-linux-x64.tar.gz       (Linux x86_64, AVX-capable)
+#   donsetch-linux-x64-noavx.tar.gz (Linux x86_64, CPUs WITHOUT AVX)
+#
+# macOS/Windows builds were removed to keep releases fast; only Linux is
+# produced, including the no-AVX variant for Bay Trail CPUs.
+#
+# The `-noavx` variant is built by build-noavx-linux: it compiles ONNX
+# Runtime from source with AVX/AVX2/AVX512 disabled as a SHARED library
+# (via scripts/build-onnxruntime-noavx.sh -> vendor/onnx/libonnxruntime.so,
+# shipped beside the binary for ort load-dynamic dlopen) and compiles out
+# the AVX gate with the `noavx` feature. It runs on a normal AVX runner;
+# the produced binary is what runs on SSE2/SSE4.2-only CPUs
+# (Bay Trail N3540/J1900, ...).
+# The ONNX source build is expensive (~30min-2h), so it is cached.
 #
 # Build steps mirror ci.yml exactly (same toolchain, same deps).
 # The only additions are: binary verification, packaging, checksums.
@@ -37,47 +46,12 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64
-            # Ubuntu 22.04 = the glibc 2.35 baseline: binaries
-            # built here run on every distro from 22.04 up. A
-            # newer builder leaks its glibc requirement into the
-            # artifact (issue #93: GLIBC_2.39 binaries on 22.04).
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            features: --features ocr,rerank,http
-            rustflags: -C target-cpu=x86-64 -C link-arg=-fuse-ld=lld
-          - name: linux-arm64
-            os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            # PDF (core) is in; OCR/rerank off: the official ONNX
-            # aarch64 prebuilt deadlocks at dlopen on native arm64.
-            features: ''
-            # bfd 2.38 on 22.04 cannot parse .crel relocations from
-            # rustc 1.98 for aarch64 (issue #93): force lld.
-            rustflags: -C link-arg=-fuse-ld=lld
-          - name: darwin-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            features: --features ocr,rerank,http
-            rustflags: ''
-          - name: darwin-x64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            # ort-sys ships no prebuilt ONNX Runtime for x86_64-apple-darwin —
-            # core build (same trade-off as linux-arm64).
-            features: ''
-            rustflags: ''
-          - name: win32-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            features: --features ocr,rerank,http
-            rustflags: ''
+    name: Build linux-x64
+    # Ubuntu 22.04 = the glibc 2.35 baseline: binaries built here run
+    # on every distro from 22.04 up. A newer builder leaks its glibc
+    # requirement into the artifact (issue #93: GLIBC_2.39 binaries
+    # on 22.04).
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v7
@@ -85,7 +59,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.98
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
       - name: Install Go
         uses: actions/setup-go@v7
@@ -93,45 +67,14 @@ jobs:
           go-version: '>=1.22.0'
 
       - name: Install NASM + LLD (Linux)
-        if: startsWith(matrix.os, 'ubuntu-')
         timeout-minutes: 5
         run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm lld
-
-      - name: Install NASM (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: brew install nasm
-
-      - name: Install NASM (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install nasm -y
-        shell: cmd
-
-      - name: Install LLVM (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "11.0"
-          directory: ${{ runner.temp }}/llvm
-
-      - name: Set LIBCLANG_PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          $clang = (Get-Command clang).Source
-          $libclangPath = Split-Path $clang
-          "LIBCLANG_PATH=$libclangPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Add NASM to PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       # Cache key: <target>-dep-<DEP_HASH>-rel1 (see ci.yml for the
       # full rationale). The version-insensitive hash is what makes
       # release builds warm: without it, every version bump nukes
       # the dependency cache and every tag build is a cold 15-25
-      # min rebuild on all five platforms.
+      # min rebuild.
       - name: Compute version-insensitive dep hash
         shell: bash
         run: |
@@ -153,7 +96,7 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}-dep-${{ env.DEP_HASH }}-rel2
+          key: release-x86_64-unknown-linux-gnu-dep-${{ env.DEP_HASH }}-rel2
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
 
@@ -163,16 +106,16 @@ jobs:
           # code runs on QEMU-emulated x86_64 and older CPUs.
           # ONNX Runtime AVX is handled separately via dynamic loading
           # (ort load-dynamic + build-time .so build + runtime AVX gate).
-          # Linux legs also pin -fuse-ld=lld per matrix.rustflags:
-          # bfd 2.38 (22.04) cannot link rustc 1.98 output (.crel).
-          RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --locked ${{ matrix.features }} --target ${{ matrix.target }}
+          # Also pin -fuse-ld=lld: bfd 2.38 (22.04) cannot link
+          # rustc 1.98 output (.crel).
+          RUSTFLAGS: -C target-cpu=x86-64 -C link-arg=-fuse-ld=lld
+        run: cargo build --release --locked --features ocr,rerank,http --target x86_64-unknown-linux-gnu
         timeout-minutes: 30
 
       # NOTE: no in-tree release-mode test sweep here anymore — it
       # re-linked test binaries with fat LTO (~15 min) to re-derive
-      # what the payload gates below now prove against the five
-      # REAL shipping assets (version check, doctor ONNX probe,
+      # what the payload gates below now prove against the REAL
+      # shipping assets (version check, doctor ONNX probe,
       # size floors, dylib presence, QEMU non-AVX run).
 
       # Verify the binary actually runs — catches broken cross-target
@@ -183,17 +126,17 @@ jobs:
       - name: Verify binary runs and reports the tag version
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          BIN=donsetch
-          if [ -f donsetch.exe ]; then BIN=donsetch.exe; fi
-          output=$(./$BIN --version 2>&1 || true)
+          cd target/x86_64-unknown-linux-gnu/release
+          output=$(./donsetch --version 2>&1 || true)
           if [ -z "$output" ]; then
             echo "ERROR: binary produced no output"
             exit 1
           fi
           echo "OK: $(echo "$output" | head -1)"
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            TAGVER="${GITHUB_REF_NAME#v}"
+            # Fork tags carry a _sync suffix (e.g. v3.6.2_sync); the binary
+            # reports the plain Cargo.toml version, so compare base only.
+            TAGVER="${GITHUB_REF_NAME#v}"; TAGVER="${TAGVER%%_*}"
             if ! echo "$output" | grep -q "$TAGVER"; then
               echo "ERROR: binary does not report the tagged version $TAGVER"
               echo "Did you bump Cargo.toml before tagging?"
@@ -212,28 +155,19 @@ jobs:
       - name: Payload integrity gates
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          BIN=donsetch
-          [ -f donsetch.exe ] && BIN=donsetch.exe
-          SIZE=$(wc -c < "$BIN")
-          case "${{ matrix.name }}" in
-            win32-x64)    NEED=25000000; EXPECT="commit probe ok" ;;
-            darwin-arm64) NEED=11000000; EXPECT="commit probe ok" ;;
-            linux-x64)    NEED=15000000; EXPECT="shared library present" ;;
-            *)            NEED=6000000;  EXPECT="not compiled" ;;
-          esac
+          cd target/x86_64-unknown-linux-gnu/release
+          SIZE=$(wc -c < donsetch)
+          NEED=15000000; EXPECT="shared library present"
           if [ "$SIZE" -lt "$NEED" ]; then
-            echo "payload gate FAIL: $BIN is ${SIZE} bytes, expected >= ${NEED}"
+            echo "payload gate FAIL: donsetch is ${SIZE} bytes, expected >= ${NEED}"
             echo "(a binary this small cannot contain the features it was built with)"
             exit 1
           fi
-          if [ "${{ matrix.name }}" = "linux-x64" ]; then
-            if [ ! -f libonnxruntime.so ] || [ "$(wc -c < libonnxruntime.so)" -lt 10000000 ]; then
-              echo "payload gate FAIL: libonnxruntime.so missing or too small"
-              exit 1
-            fi
+          if [ ! -f libonnxruntime.so ] || [ "$(wc -c < libonnxruntime.so)" -lt 10000000 ]; then
+            echo "payload gate FAIL: libonnxruntime.so missing or too small"
+            exit 1
           fi
-          OUT=$(./$BIN doctor 2>&1 || true)
+          OUT=$(./donsetch doctor 2>&1 || true)
           echo "$OUT" | grep -q "ONNX Runtime.*${EXPECT}" || {
             echo "payload gate FAIL: doctor did not report the expected ONNX state"
             echo "$OUT" | grep -i onnx || true
@@ -241,7 +175,7 @@ jobs:
           }
           echo "payload gates ok: ${SIZE} bytes, ONNX probe: ${EXPECT}"
 
-      # ── glibc baseline gate (Linux legs) ────────────────────
+      # ── glibc baseline gate ──────────────────────────────────
       # The binary must not demand any glibc symbol newer than
       # 2.35 (Ubuntu 22.04). This is the hard tripwire for issue
       # #93: building on a newer runner used to leak GLIBC_2.39
@@ -250,10 +184,9 @@ jobs:
       # bytes, so a regression fails the release here, not on a
       # user's VM.
       - name: Verify glibc baseline
-        if: startsWith(matrix.os, 'ubuntu-')
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/x86_64-unknown-linux-gnu/release
           if ! command -v objdump >/dev/null 2>&1; then
             sudo apt-get install -y --no-install-recommends binutils >/dev/null 2>&1 || true
           fi
@@ -271,18 +204,17 @@ jobs:
           fi
           echo "OK: glibc baseline <= 2.35 satisfied"
 
-      # ── QEMU non-AVX verification (Linux x64 only) ──────────
+      # ── QEMU non-AVX verification ────────────────────────────
       #
       # The binary must run on non-AVX CPUs without SIGILL. QEMU's
       # qemu64 CPU model has SSE2 only (no AVX). If the binary crashes
       # here, the ONNX dynamic loading fix is broken. This catches
       # regressions where AVX instructions leak into the base binary.
       - name: Verify no SIGILL on non-AVX CPU (QEMU)
-        if: matrix.name == 'linux-x64'
         shell: bash
         run: |
           sudo apt-get install -y --no-install-recommends qemu-user >/dev/null 2>&1 || true
-          cd target/${{ matrix.target }}/release
+          cd target/x86_64-unknown-linux-gnu/release
           # Clear AVX cache so the CPUID check is actually performed.
           rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
           output=$(qemu-x86_64 -cpu qemu64 ./donsetch --version 2>&1 || true)
@@ -293,35 +225,14 @@ jobs:
           echo "OK: binary runs on non-AVX CPU (QEMU qemu64)"
           echo "$output" | head -1
 
-      # Package only DonSeTch release assets. CloakBrowser remains a
-      # user-managed runtime dependency and is never bundled here.
-      # All platforms: tar.gz. Windows includes pdfium.dll alongside
-      # donsetch.exe. Using tar.gz (not zip) for all platforms means
-      # the npm install.js postinstall only needs one extraction method.
+      # Package only DonSeTch release assets. The ONNX shared lib ships
+      # beside the binary (built by build.rs for runtime dlopen).
+      # tar.gz keeps the npm install.js happy (one extraction method).
 
-      - name: Package (Unix)
-        if: matrix.os != 'windows-latest'
+      - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
-          # Include ONNX shared lib if present (Linux x64 + arm64,
-          # shipped by build.rs for runtime dlopen). macOS/Windows
-          # use static linking.
-          if [ -f libonnxruntime.so ]; then
-            tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch libonnxruntime.so
-          else
-            tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch
-          fi
-
-      - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: cmd
-        run: |
-          cd target\${{ matrix.target }}\release
-          if not exist pdfium.dll (
-            echo ERROR: pdfium.dll not found - build.rs copy failed
-            exit 1
-          )
-          tar czf %GITHUB_WORKSPACE%\donsetch-${{ matrix.name }}.tar.gz donsetch.exe pdfium.dll
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf $GITHUB_WORKSPACE/donsetch-linux-x64.tar.gz donsetch libonnxruntime.so
 
       # ── Checksums ────────────────────────────────────────────
       # sha256sum format: "<hash>  <filename>" — compatible with
@@ -331,17 +242,226 @@ jobs:
         shell: bash
         run: |
           cd "$GITHUB_WORKSPACE"
-          sha256sum donsetch-${{ matrix.name }}.tar.gz | tee donsetch-${{ matrix.name }}.tar.gz.sha256
+          sha256sum donsetch-linux-x64.tar.gz | tee donsetch-linux-x64.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: donsetch-${{ matrix.name }}
-          path: donsetch-${{ matrix.name }}.*
+          name: donsetch-linux-x64
+          path: donsetch-linux-x64.*
+
+  # ── Linux x86_64 no-AVX build ─────────────────────────────
+  # For CPUs without AVX (Intel Bay Trail N3540/J1900, ...). ONNX Runtime
+  # is compiled from source with AVX disabled as a shared library
+  # (scripts/build-onnxruntime-noavx.sh -> vendor/onnx/libonnxruntime.so,
+  # shipped beside the binary for ort load-dynamic dlopen) and the AVX
+  # gate is compiled out with the `noavx` feature. The ONNX build is
+  # cached so subsequent releases skip the ~30min-2h source build.
+  # This binary runs on BOTH AVX and non-AVX CPUs — when in doubt,
+  # ship/use the noavx build.
+  build-noavx-linux:
+    name: Build linux-x64-noavx
+    runs-on: ubuntu-22.04
+    env:
+      ORT_TAG: rel-1.24.2
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+
+      - name: Install build deps (NASM, ninja, LLD)
+        timeout-minutes: 5
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm ninja-build lld
+
+      - name: Cache ONNX Runtime no-AVX build
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/onnxruntime-noavx
+            vendor/onnx
+          key: onnx-noavx-${{ runner.os }}-${{ env.ORT_TAG }}
+          restore-keys: |
+            onnx-noavx-${{ runner.os }}-
+
+      - name: Build ONNX Runtime without AVX (shared lib)
+        run: bash ./scripts/build-onnxruntime-noavx.sh --jobs $(nproc)
+
+      - name: Compute version-insensitive dep hash
+        shell: bash
+        run: |
+          DEP_HASH=$(python3 - <<'EOF'
+          import hashlib, pathlib, re
+          h = hashlib.sha256()
+          lock = pathlib.Path('Cargo.lock').read_text()
+          lock = re.sub(r'name = "donsetch"\nversion = "[^"]+"',
+                        'name = "donsetch"', lock)
+          h.update(lock.encode())
+          for p in sorted(pathlib.Path('.').rglob('Cargo.toml')):
+              t = re.sub(r'\n\s*version\s*=\s*"[^"]*"', '', p.read_text())
+              h.update(p.name.encode()); h.update(t.encode())
+          print(h.hexdigest()[:16])
+          EOF
+          )
+          echo "DEP_HASH=$DEP_HASH" >> "$GITHUB_ENV"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-unknown-linux-gnu-noavx-dep-${{ env.DEP_HASH }}-rel2
+          add-rust-environment-hash-key: "false"
+          cache-on-failure: "true"
+
+      - name: Build donsetch (noavx)
+        env:
+          # Baseline ISA only — never native: the point of this binary
+          # is running on CPUs without AVX.
+          RUSTFLAGS: -C target-cpu=x86-64 -C link-arg=-fuse-ld=lld
+        run: cargo build --release --locked --features ocr,rerank,noavx --target x86_64-unknown-linux-gnu
+        timeout-minutes: 30
+
+      - name: Verify binary runs and reports the tag version
+        shell: bash
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          output=$(./donsetch --version 2>&1 || true)
+          if [ -z "$output" ]; then
+            echo "ERROR: binary produced no output"
+            exit 1
+          fi
+          echo "OK: $(echo "$output" | head -1)"
+          # Fork tags carry a _sync suffix (e.g. v3.6.2_sync); the binary
+          # reports the plain Cargo.toml version, so compare base only.
+          TAGVER="${GITHUB_REF_NAME#v}"; TAGVER="${TAGVER%%_*}"
+          if ! echo "$output" | grep -q "$TAGVER"; then
+            echo "ERROR: binary does not report the tagged version $TAGVER"
+            echo "Did you bump Cargo.toml before tagging?"
+            exit 1
+          fi
+          # The noavx build must self-report its feature set.
+          echo "$output" | grep -q "noavx" || echo "NOTE: DONSHEET_FEATURES does not list noavx"
+
+      # ── Payload integrity gates (noavx) ───────────────────
+      # Same tripwire idea as the standard leg: the binary must be big
+      # enough to contain OCR/rerank, and the SELF-BUILT .so must ship
+      # beside it. The .so floor is deliberately NOT the standard leg's
+      # 10MB: a source-built shared lib has a different size.
+      # TODO: after the first noavx release, calibrate BOTH floors below
+      # against the actual artifact sizes (binary NEED + .so sanity) and
+      # tighten them so size regressions fail loudly.
+      - name: Payload integrity gates (noavx)
+        shell: bash
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          SIZE=$(wc -c < donsetch)
+          NEED=15000000
+          if [ "$SIZE" -lt "$NEED" ]; then
+            echo "payload gate FAIL: donsetch is ${SIZE} bytes, expected >= ${NEED}"
+            exit 1
+          fi
+          if [ ! -f libonnxruntime.so ]; then
+            echo "payload gate FAIL: libonnxruntime.so missing beside the noavx binary"
+            exit 1
+          fi
+          SOSIZE=$(wc -c < libonnxruntime.so)
+          if [ "$SOSIZE" -lt 1048576 ]; then
+            echo "payload gate FAIL: libonnxruntime.so is only ${SOSIZE} bytes (>1MB sanity)"
+            exit 1
+          fi
+          head -c 4 libonnxruntime.so | grep -q $'\x7fELF' || {
+            echo "payload gate FAIL: libonnxruntime.so is not an ELF shared library"
+            exit 1
+          }
+          OUT=$(./donsetch doctor 2>&1 || true)
+          echo "$OUT" | grep -q "ONNX Runtime.*shared library loaded" || {
+            echo "payload gate FAIL: doctor did not report the noavx ONNX probe"
+            echo "$OUT" | grep -i onnx || true
+            exit 1
+          }
+          echo "payload gates ok: binary ${SIZE} bytes, .so ${SOSIZE} bytes, ONNX probe ok"
+
+      # ── glibc baseline gate (noavx leg) ────────────────────
+      # Same 2.35 ceiling as the standard leg: the noavx binary must
+      # also run on every distro from Ubuntu 22.04 up.
+      - name: Verify glibc baseline (noavx)
+        shell: bash
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          if ! command -v objdump >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends binutils >/dev/null 2>&1 || true
+          fi
+          MAXGLIBC=$(objdump -T donsetch | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "max GLIBC version required by the noavx binary: $MAXGLIBC"
+          if [ -z "$MAXGLIBC" ]; then
+            echo "ERROR: no GLIBC versioned symbols found — objdump failed or binary is static"
+            exit 1
+          fi
+          HIGHER=$(printf '2.35\n%s\n' "$MAXGLIBC" | sort -V | tail -1)
+          if [ "$HIGHER" = "$MAXGLIBC" ] && [ "$MAXGLIBC" != "2.35" ]; then
+            echo "ERROR: noavx binary requires GLIBC_$MAXGLIBC, exceeds the 2.35 baseline"
+            exit 1
+          fi
+          echo "OK: glibc baseline <= 2.35 satisfied"
+
+      # ── QEMU non-AVX verification (noavx) ──────────────────
+      # The whole point of this binary: it must not only START without
+      # AVX (like the standard leg) but actually RUN OCR/rerank there.
+      # qemu64 has SSE2 only. doctor must pass the real dlopen+commit
+      # probe, and the sample scan must OCR to real text.
+      - name: QEMU doctor + OCR smoke (noavx)
+        shell: bash
+        run: |
+          sudo apt-get install -y --no-install-recommends qemu-user >/dev/null 2>&1 || true
+          cd target/x86_64-unknown-linux-gnu/release
+          rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
+          qemu-x86_64 -cpu qemu64 ./donsetch doctor 2>&1 | tee /tmp/doctor-noavx-qemu.log
+          grep -q "ONNX Runtime.*shared library loaded" /tmp/doctor-noavx-qemu.log || {
+            echo "ERROR: noavx doctor probe failed under QEMU qemu64 (no AVX)"
+            grep -i onnx /tmp/doctor-noavx-qemu.log || true
+            exit 1
+          }
+          echo "OK: noavx doctor passes on non-AVX CPU (QEMU qemu64)"
+          rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
+          timeout 600 qemu-x86_64 -cpu qemu64 ./donsetch fetch "$GITHUB_WORKSPACE/ocr-sample-scan.pdf" --max-chars 500 2>&1 | tee /tmp/ocr-noavx-qemu.log
+          grep -qiE "confidence|ocr|page" /tmp/ocr-noavx-qemu.log || {
+            echo "ERROR: noavx OCR smoke produced no OCR markers under QEMU"
+            exit 1
+          }
+          echo "OK: noavx OCR smoke produces text on non-AVX CPU (QEMU qemu64)"
+        timeout-minutes: 30
+
+      # ── Package ──────────────────────────────────────────
+      # tar.gz keeps npm install.js happy (one extraction method).
+      # The self-built libonnxruntime.so ships INSIDE the tarball —
+      # without it the noavx binary has no ONNX payload.
+      - name: Package
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf $GITHUB_WORKSPACE/donsetch-linux-x64-noavx.tar.gz donsetch libonnxruntime.so
+
+      - name: Compute SHA256
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          sha256sum donsetch-linux-x64-noavx.tar.gz | tee donsetch-linux-x64-noavx.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: donsetch-linux-x64-noavx
+          path: donsetch-linux-x64-noavx.*
 
   release:
     name: Create Release
-    needs: build
+    needs: [build, build-noavx-linux]
     # Dispatch runs exercise build + every gate without publishing.
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
@@ -361,23 +481,36 @@ jobs:
       # CHANGELOG.md so the release page reads like the changelog,
       # not like a commit log. GitHub's auto-generated notes are
       # appended below it.
+      #
+      # Fork tags carry a _sync suffix (e.g. v3.6.2_sync) that never has
+      # an upstream CHANGELOG section — try the full tag first, then the
+      # base version ([3.6.2] for v3.6.2_sync), and degrade to a minimal
+      # body instead of failing the release if neither exists.
       - name: Build release notes from CHANGELOG
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
           python3 - <<'EOF'
-          import os, re, sys
+          import os, re
           tag = os.environ["TAG_VERSION"].lstrip("v")
-          text = open("CHANGELOG.md", encoding="utf-8").read()
-          m = re.search(r"^## \[" + re.escape(tag) + r"\] - .*?$", text, re.M)
+          base = tag.split("_")[0]
+          text = ""
+          if os.path.exists("CHANGELOG.md"):
+              text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(r"^## \[" + re.escape(tag) + r"\] - .*?$", text, re.M) \
+              or re.search(r"^## \[" + re.escape(base) + r"\] - .*?$", text, re.M)
           if not m:
-              sys.exit(f"CHANGELOG.md has no [{tag}] section — add it before tagging")
-          start = m.end()
-          nxt = re.search(r"^## \[.*?\]", text[start:], re.M)
-          section = text[start:start + nxt.start()] if nxt else text[start:]
-          header = f"DonSeTch v{tag}\n\n"
-          open("RELEASE_BODY.md", "w", encoding="utf-8").write(header + section.strip() + "\n")
-          print(f"RELEASE_BODY.md: {len(section.splitlines())} lines from [{tag}]")
+              open("RELEASE_BODY.md", "w", encoding="utf-8").write(
+                  f"DonSeTch v{tag}\n\nNo CHANGELOG section for [{tag}].\n")
+              print(f"RELEASE_BODY.md: fallback — no CHANGELOG section for [{tag}]")
+          else:
+              start = m.end()
+              nxt = re.search(r"^## \[.*?\]", text[start:], re.M)
+              section = text[start:start + nxt.start()] if nxt else text[start:]
+              header = f"DonSeTch v{tag}\n\n"
+              open("RELEASE_BODY.md", "w", encoding="utf-8").write(header + section.strip() + "\n")
+              found = re.search(r"\[(.*?)]", m.group(0)).group(1)
+              print(f"RELEASE_BODY.md: {len(section.splitlines())} lines from [{found}]")
           EOF
 
       - name: Create GitHub Release
