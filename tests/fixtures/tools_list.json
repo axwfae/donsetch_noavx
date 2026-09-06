@@ -1,0 +1,286 @@
+{
+  "tools": [
+    {
+      "description": "Read one URL or a deliberate URL batch as source markdown. Use search to discover URLs and crawl for multiple pages from one site. Prefer the smallest view that can supply the required evidence, and continue only from returned continuation state. Do not repeat a successful read unless it was thin, truncated, or failed. Automatic acquisition may use HTTP, a browser, an adapter, PDF extraction, or an archive. Treat content_ok=false, thin=true, or a stable error code as unresolved; follow next_action or choose another source. Cite the returned source URL.",
+      "inputSchema": {
+        "properties": {
+          "actions": {
+            "description": "Ordered page interactions before reading (1-16 objects). Each object requires do. Required fields: wait uses ms; wait_selector uses selector; wait_text uses text; click/hover uses selector or text; type uses text and optional selector; press uses key; scroll uses to or px. The first failed step stops and is reported.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "do": {
+                  "enum": [
+                    "wait",
+                    "wait_selector",
+                    "wait_text",
+                    "click",
+                    "hover",
+                    "type",
+                    "press",
+                    "scroll"
+                  ],
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "ms": {
+                  "type": "integer"
+                },
+                "px": {
+                  "type": "integer"
+                },
+                "selector": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "timeout_ms": {
+                  "type": "integer"
+                },
+                "to": {
+                  "enum": [
+                    "top",
+                    "bottom",
+                    "down",
+                    "px"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "do"
+              ],
+              "type": "object"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "archive": {
+            "description": "Archived-page policy: auto (default) falls back when the live page is unavailable; only skips the live page; off disables archive recovery.",
+            "enum": [
+              "auto",
+              "only",
+              "off"
+            ],
+            "type": "string"
+          },
+          "budget_tokens": {
+            "description": "Shared output-token limit for a URL batch (200-500000). Omit for one URL. Truncated members return continuation information.",
+            "type": "integer"
+          },
+          "deadline_ms": {
+            "description": "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang. Batch mode: per-URL budget.",
+            "type": "integer"
+          },
+          "focus": {
+            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response is labeled and falls back to the full page.",
+            "type": "string"
+          },
+          "image_text": {
+            "description": "Extract words from up to 4 content images. Enable only when requested evidence is inside an infographic, screenshot, comic or other image.",
+            "type": "boolean"
+          },
+          "links": {
+            "description": "Include destination URLs found inside page content. The fetched page's own citation URL is always returned separately; enable only when outbound targets are requested evidence.",
+            "type": "boolean"
+          },
+          "max_chars": {
+            "description": "Max markdown chars (default 16000). Truncated pages include next_offset for resumption.",
+            "type": "integer"
+          },
+          "media": {
+            "description": "Include image alt text and source URLs. Use image_text instead when words inside an image must be read.",
+            "type": "boolean"
+          },
+          "must_contain": {
+            "description": "Case-insensitive string or /regex/ presence check. Returns MATCH/NO-MATCH and up to 3 excerpts instead of the full page; use for verification, not general reading.",
+            "type": "string"
+          },
+          "offset": {
+            "description": "Continue from a previous next_offset. Reuse the same URL and any focus, section, selector or rendering fields from that fetch.",
+            "type": "integer"
+          },
+          "section": {
+            "description": "Heading name (substring, case-insensitive) : return only that section. Use after toc to target a specific part.",
+            "type": "string"
+          },
+          "selector": {
+            "description": "CSS selector for extracting only matching elements. Set only when the selector is known; focus may filter passages inside that region.",
+            "type": "string"
+          },
+          "shot": {
+            "description": "File path : saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool.",
+            "type": "string"
+          },
+          "since_last": {
+            "description": "Standalone change check for a previously fetched URL. Returns an unchanged verdict or changed sections instead of the full page. Do not combine with reading filters or rendering fields.",
+            "type": "boolean"
+          },
+          "stitch": {
+            "description": "Read all parts of a paginated article in one call (up to 6 parts / 48000 chars). Enable only when the requested source spans article pages.",
+            "type": "boolean"
+          },
+          "tier": {
+            "description": "auto (default, always use for real work): HTTP first, auto-escalates to headless browser on bot-walls/JS-shells, auto-detects and parses PDFs. \"1\" (testing): HTTP only, no browser : fails on JS sites. \"2\" (testing): browser directly : slower, skips HTTP entirely.",
+            "enum": [
+              "auto",
+              "1",
+              "2"
+            ],
+            "type": "string"
+          },
+          "toc": {
+            "description": "Return only the heading outline. Use as a standalone first read, then make a new fetch with section or focus.",
+            "type": "boolean"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ],
+            "description": "One http(s) URL, an S/L handle returned earlier, or an array of up to 12 URLs or handles for one batch read."
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "web_fetch"
+    },
+    {
+      "description": "Discover ranked candidate sources. Use this before fetch when you do not already have a URL; it returns titles and snippets, not page contents. A snippet supports only claims it states explicitly. Treat weak or degraded results as incomplete, and fetch a candidate when its full text is required. Search handles resolve directly in fetch; cite source URLs from structuredContent.",
+      "inputSchema": {
+        "properties": {
+          "deadline_ms": {
+            "description": "Hard time budget in ms (500-600000). Engines have their own timeouts; this caps the whole call. On expiry: honest deadline error.",
+            "type": "integer"
+          },
+          "intent": {
+            "description": "auto (default) detects from query. code: adds GitHub, HN, StackExchange, MDN verticals. paper: adds Scholar, arXiv. news: adds Google News, HN. entity: adds Wikipedia. web: general only.",
+            "enum": [
+              "auto",
+              "web",
+              "code",
+              "paper",
+              "news",
+              "entity"
+            ],
+            "type": "string"
+          },
+          "max_results": {
+            "description": "Maximum ranked candidates to return (default 7, max 12). Increase only when the returned candidate set is insufficient.",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Primary search formulation. Include required entities, dates, versions and exclusions; do not include a guessed answer.",
+            "type": "string"
+          },
+          "query_variants": {
+            "description": "Optional array; maximum 2 alternate formulations for the same unmet requirement. Preserve entities and hard constraints; vary vocabulary, terminology, language or answer-bearing phrasing. Omit when no distinct retrieval angle exists.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 2,
+            "type": "array"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "web_search"
+    },
+    {
+      "description": "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs.",
+      "inputSchema": {
+        "properties": {
+          "deadline_s": {
+            "description": "Hard crawl deadline in seconds (default 120, range 5-600). Partial results return after.",
+            "type": "integer"
+          },
+          "exclude_paths": {
+            "description": "Path globs to exclude (e.g. [\"*/tags/*\", \"*/archive/*\"]).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "focus": {
+            "description": "Topic or question for selecting relevant pages and passages. Set when the request targets one subject; omit only when the whole site scope is relevant.",
+            "type": "string"
+          },
+          "include_paths": {
+            "description": "Path globs to include (e.g. [\"/docs/*\"]). Empty = all.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "max_depth": {
+            "description": "Max link depth from seed (default 2). 0 = seed only.",
+            "type": "integer"
+          },
+          "max_pages": {
+            "description": "Max pages to fetch+extract (default 10, cap 200).",
+            "type": "integer"
+          },
+          "max_total_chars": {
+            "description": "Total extracted-char budget across all pages (default 60000, range 4000-500000).",
+            "type": "integer"
+          },
+          "mode": {
+            "description": "full (default) discovers pages and reads content; map returns only the URL inventory; content follows links from the seed when no usable site map exists.",
+            "enum": [
+              "full",
+              "map",
+              "content"
+            ],
+            "type": "string"
+          },
+          "per_page_max": {
+            "description": "Max markdown chars per page (default 8000, range 400-40000).",
+            "type": "integer"
+          },
+          "respect_robots": {
+            "description": "Obey robots.txt Disallow + crawl-delay (default true).",
+            "type": "boolean"
+          },
+          "resume": {
+            "description": "Opaque token returned by a stopped crawl. Send it instead of url to continue saved progress; do not invent or alter it. A new crawl requires url and omits resume.",
+            "type": "string"
+          },
+          "same_host": {
+            "description": "Stay on seed's host (default true). false = follow cross-domain links.",
+            "type": "boolean"
+          },
+          "since_last": {
+            "description": "Return only pages new or changed since the last crawl of this site. Use for monitoring or a repeated crawl, not a first visit.",
+            "type": "boolean"
+          },
+          "url": {
+            "description": "Seed http(s) URL to crawl from.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "web_crawl"
+    }
+  ]
+}
