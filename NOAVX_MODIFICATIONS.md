@@ -11,7 +11,9 @@
 
 **為什麼存在**：donsetch 的 OCR / 語意 rerank 功能依賴 ONNX Runtime。4.0.0 的 Linux 標準建置在編譯期下載微軟官方 `onnxruntime-linux-x64-1.24.2.tgz` 的 `.so` 隨 binary 出貨，runtime 經 `src/onnx.rs::ensure_loaded()` 先過 AVX gate 再 dlopen。在沒有 AVX 的老 CPU 上（Intel Bay Trail Atom/Celeron N3540、J1900 等，只有 SSE4.2）標準版的 OCR/rerank 被 gate 擋下。本目錄的所有修改都是為了讓 OCR/rerank 在無 AVX CPU 上真正可用：出貨自編的無 AVX `.so`，並把 AVX gate 編譯掉。
 
-**目錄定位**：本目錄只攜帶 noavx 建置設定、CI workflow、文件，以及 **`src/` 中「有修改」的檔案**（共 5 個：`src/cli/{update,version,status}.rs`、`src/cli/doctor.rs`、`src/onnx.rs`，見第 3 節）。未修改的原始碼一律不同步進來——建置時把本目錄疊在 `donsetch-4.0.0` 原始碼樹上使用。升級版本時需重新套用這些檔案修改（見第 5 節）。
+**目錄定位**：本目錄只攜帶 noavx 建置設定、CI workflow、文件、`src/` 中「有修改」的檔案（共 5 個，見第 3 節），以及**根目錄的 `Cargo.lock`**（唯一例外：與基底逐位元組相同，原樣攜帶只為防呆——見下）。未修改的原始碼一律不同步進來——建置時把本目錄疊在 `donsetch-4.0.0` 原始碼樹上使用。升級版本時需重新套用這些檔案修改（見第 5 節）。
+
+> **Cargo.lock 例外的原因（4.0.0 實測教訓）**：4.0.0 新增 git 依賴 `quiche`（tag pin）。fork 端若沿用舊版（如 3.6.2 時代）的 `Cargo.lock`，內無 quiche 條目，CI 的 `cargo build --locked` 會因「需改 lock」而失敗（`cannot update the lock file ... --locked was passed`）。已用 `git ls-remote` 驗證 tag 指向與 lock pin 一致（fb579bcf），排除 tag 移位——純粹是 fork 端 lock 過期。此後每次升版**必須同步基底的 `Cargo.lock`**（見第 5 節），本目錄直接攜帶一份即鎖定正確版本，免除人肉同步漏掉的風險。`noavx = []` 是空 feature，不影響依賴解析，故基底 lock 可直接沿用。
 
 **佈局跟隨基底**：4.0.0 上游 workflows 位於 `.github/workflows/`（3.6.2 與 4.0.0 一致），故本目錄僅保留 `.github/workflows/`，**不要建 `github/` 鏡像**。
 
@@ -105,6 +107,7 @@ _362 時代我們被迫維護的兩塊 patch（`update.rs` 的 Unix `.so` 安裝
   python3 -c "import yaml; yaml.safe_load(open('donsetch_noavx_400/.github/workflows/release.yml'))"
   grep -rn "dondai44423" donsetch_noavx_400/   # 應只剩 README 的 wrb 段與 dsh 段、CONTRIBUTING 的 Reviewers 表格與本文件記錄原始值處
   find donsetch_noavx_400/src -type f          # 必須恰好 5 個檔案（rollback.rs 必須不在內）
+  diff donsetch_noavx_400/Cargo.lock donsetch-4.0.0/Cargo.lock  # 必須無差異（防 --locked 失敗；含 quiche 條目）
   diff donsetch_noavx_400/src/cli/update.rs donsetch-4.0.0/src/cli/update.rs   # 僅 REPO + 資產選擇兩處
   diff donsetch_noavx_362/build.rs donsetch_noavx_400/build.rs   # 僅上游 4.0.0 新增（version-resource 三處）
   grep -n "download-binaries\|simd" donsetch_noavx_400/Cargo.toml  # oar-ocr 保持原樣（含 simd）
@@ -115,7 +118,7 @@ _362 時代我們被迫維護的兩塊 patch（`update.rs` 的 Unix `.so` 安裝
 ## 5. 升級到新版 donsetch 時的移植步驟
 
 1. 建立新目錄 `donsetch_noavx_<新版號>/`。
-2. 版本無關檔案直接複製：`TESTING.md`、`ocr-sample-scan.pdf`、`scripts/build-onnxruntime-noavx.sh`（若新版仍是 load-dynamic 架構；若上游改回靜態連結，需重新評估整套設計；另先確認 build.rs ONNX 段——`fetch_onnx_prebuilt`/`copy_onnx_shared_lib`/`vendor/onnx` 路徑——未變）。
+2. 版本無關檔案直接複製：`TESTING.md`、`ocr-sample-scan.pdf`、`scripts/build-onnxruntime-noavx.sh`（若新版仍是 load-dynamic 架構；若上游改回靜態連結，需重新評估整套設計；另先確認 build.rs ONNX 段——`fetch_onnx_prebuilt`/`copy_onnx_shared_lib`/`vendor/onnx` 路徑——未變）。**另從新版基底複製 `Cargo.lock`（不是從舊 overlay 沿用！舊 lock 缺新依賴會導致 CI `--locked` 失敗；複製後 `diff` 確認與基底一致）。**
 3. 其餘檔案從新版原始目錄複製後，按第 3 節逐項套用修改（**不可盲目 patch**；先確認新版 `github/` vs `.github/` 佈局——跟隨基底，不要建鏡像；`doctor.rs` 若上游在 `check_onnx` 之外加了新函數，必須等價編輯、不可整檔複製舊版）。
 4. 先檢查上游是否修了我們 patch 過的 bug（如本次的 SIBLING_LIBS）：若修了且本地驗證覆蓋完整，退役我們的對應 patch 並在本文件記錄驗證過程；若只覆蓋部分路徑，保留我們的對應部分並回報。
 5. **重改新版 `src/cli/{update,version,status}.rs` 的 `REPO` 常數、新版 `check_onnx` 重加 cfg 分支、重包 `src/onnx.rs` 的 gate、新版 `platform_asset_name` 重加 noavx 分支**後，只同步修改過的檔案至新目錄的 `src/`（保持相對路徑；未修改的 src 檔案一律不同步）。
