@@ -518,35 +518,11 @@ jobs:
               print(f"RELEASE_BODY.md: {len(section.splitlines())} lines from [{found}]")
           EOF
 
-      # Release gate (ported from upstream 4.2.5): never mint a draft
-      # off a red commit. The tag points at the master head that was
-      # pushed seconds before it, so the CI run for this exact SHA is
-      # already in flight. Poll for its conclusion (bounded ~40 min);
-      # a red or missing CI blocks the release instead of shipping
-      # unverified assets. Follows the upstream layout: the gate sits
-      # only here, before publishing — the build jobs above are not
-      # gated themselves.
-      - name: Wait for CI on this commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          conclusion=""
-          for i in $(seq 1 60); do
-            # A cancelled or still-running duplicate is not evidence about
-            # this commit: a later push (or a rerun of an older SHA) can
-            # cancel this SHA's run through the CI concurrency group, and
-            # blocking on that ships nothing. Poll for a real verdict, and
-            # still refuse on an actual failure.
-            conclusion=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}" \
-              --jq '[.workflow_runs[] | select(.name == "CI") | .conclusion | select(. != null and . != "cancelled" and . != "skipped")] | first // ""')
-            [ -n "$conclusion" ] && break
-            sleep 30
-          done
-          echo "CI conclusion for ${{ github.sha }}: ${conclusion:-none}"
-          if [ "$conclusion" != "success" ]; then
-            echo "release blocked: CI on this commit is ${conclusion:-missing}; fix and re-tag"
-            exit 1
-          fi
+      # Fork decision: NO "Wait for CI" gate here (upstream 4.2.5 has
+      # one). This fork syncs version snapshots, not every push — CI may
+      # never have run on the tagged SHA, which would block every release
+      # after ~30 min of empty polling. Verification lives in the build
+      # jobs above (payload gates, doctor probe, QEMU) instead.
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
