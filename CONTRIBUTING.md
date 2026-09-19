@@ -5,13 +5,13 @@ Thanks for your interest in contributing. DonSeTch is AGPL v3 — all contributi
 ## Build from source
 
 ```bash
-git clone https://github.com/dondai44423/donsetch.git
-cd donsetch
+git clone https://github.com/axwfae/donsetch_noavx.git
+cd donsetch_noavx
 cargo build --release                     # core build (fetch, search, crawl, PDF)
 # For the dev loop use `just bin` (target/fast/donsetch, seconds) and
 # `just bin-ci` when release-profile parity matters: these two lines below
 # compile the release-shaped graph, which is the slowest thing here.
-cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking)
+cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking; auto-downloads the official ONNX .so, needs AVX)
 ```
 
 **Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#-install) for platform-specific install commands.
@@ -36,8 +36,15 @@ corpus, landmarks, live probes).
 
 Do **not** make a bare `cargo test` or `cargo build --release` your edit loop:
 those compile another artifact graph, and recompiling it is the slowest thing in
-this repository. CI is the full gate (5 platforms, in parallel); `just all` is
-the only local gate you need before pushing.
+this repository. CI is the full gate on the upstream repo (5 platforms,
+in parallel); this fork builds Linux x86_64 only (noavx is Linux-only),
+and `just all` is the only local gate you need before pushing.
+
+CPUs without AVX: build ONNX Runtime from source first
+(`./scripts/build-onnxruntime-noavx.sh`, output at
+`vendor/onnx/libonnxruntime.so`), then
+`cargo build --release --features ocr,rerank,noavx` — see the README
+section "Build for CPUs without AVX".
 
 [`sccache`](https://github.com/mozilla/sccache) is picked up automatically when
 installed (`rust-sccache` on Void, `sccache` elsewhere): recompiles across
@@ -159,7 +166,7 @@ DonSeTch is built from scratch — no dependency on existing OSS web tooling:
 2. Write tests for your change.
 3. Ensure `just all` passes and let CI (the full matrix) be the gate.
 4. Open a PR with a conventional commit title.
-5. CI must be green on all 3 platforms before merge.
+5. CI must be green on Linux before merge.
 
 ## Reporting issues
 
