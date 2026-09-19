@@ -31,20 +31,15 @@
 
 4.2.5 的 `donsetch --version` 會做一次 live update check（3s timeout，`DONSETCH_NO_UPDATE_CHECK` 或 `CI` 環境變數可跳過）。`update.rs`/`status.rs` 的 `REPO` 改 fork 後，該 check 打的是 fork 的 releases.atom——功能正確，但 release.yml 的版本驗證 gate 不應依賴網路。故本目錄的 `release.yml` 在**兩個** Verify-binary 步驟（標準 leg + noavx leg，上游只有一个 matrix leg，fork 有兩個）都加了 `DONSETCH_NO_UPDATE_CHECK: "1"`（port 自上游 release.yml 的同名 env）。`--version` 的其餘邏輯（DISPLAY 化妝、profile 標籤）一字不動。
 
-### 2.3 Release 新增「Wait for CI on this commit」gate → fork 跟進
+### 2.3 Release 的「Wait for CI on this commit」gate → fork 不跟進（已移除）
 
-上游 4.2.5 在 `release` job（publish 前）新增 CI 結論轮询 gate（~40min 上限），並把 `ci.yml` 的 concurrency 改為 push 按 SHA 分組（否則下一次 master push 會取消 gate 正在等的 run）。本目錄兩處都 port：
+上游 4.2.5 在 `release` job（publish 前）新增 CI 結論轮询 gate（~40min 上限），並把 `ci.yml` 的 concurrency 改為 push 按 SHA 分組。本 fork 的用法是同步版本快照、不保證 tag 前有 master push 的 CI run——gate 會空轉 ~30 分鐘後以「CI missing」擋掉每一次發版（4.2.5 實測確認），故**移除該 gate**（`release.yml` 僅留 fork 決策註解）。驗證責任由各 build job 自帶的 gates（payload、doctor、QEMU）承擔，與 4.0.0 之前的做法一致（那時刪 ci.yml 也能正常 release）。
 
-- `release.yml`：在 `release` job 的「Build release notes」與「Create GitHub Release」之間插入原文 gate。**跟隨上游佈局**：gate 只在 publish 前，`build` / `build-noavx-linux` 兩個 job 不加。
-- `ci.yml`：concurrency 改為按 SHA 分組（含上游註解）+ 保留 fork 的 PR 語義說明（master 段舊註解已按新語義改寫）。
+（本節原記載 per-SHA concurrency 的 port；ci.yml 已刪除，該項作廢，見第 2.4 節。）
 
-### 2.4 CI 新增 nightly / lanes / timeout → fork 等價 port
+### 2.4 CI（ci.yml）→ fork 不攜帶（已刪除）
 
-上游 4.2.5 的 `ci.yml` 新增：`schedule`（06:00 UTC）+ `workflow_dispatch`、per-SHA concurrency、`tests: full/smoke/none` lanes、full lane timeout 60、fuzz 改為「PR 跑 1 個、push/nightly 跑 5 個」的動態矩陣。本目錄（Linux-only 單 job，無 lanes 概念）等價 port：
-
-- triggers：加 `schedule` + `workflow_dispatch`（nightly 重跑同一 Linux suite + 全 fuzz targets，防上游漂移 bitrot；上游的 `heavy` job 不 port——那是多平台矩陣的範疇，fork 保持 Linux-only）。
-- Test 步驟：沿用單一 full-suite 命令（即上游 `tests: full` lane 的語義），timeout 30→60，並附上游 cold-build 註解。
-- fuzz 矩陣：`target:` 改為上游原文的 `fromJSON(...)` 動態式（含「勿用 job-level if」的註解）。
+本 fork 只同步版本快照、推送不跑 CI（4.0.0 之前即刪 ci.yml 照常 release），且 release 已移除 Wait-for-CI gate（見第 2.3 節），故 `ci.yml` **直接刪除不攜帶**（用戶決策）。上游 4.2.5 的 ci 新增（nightly schedule、per-SHA concurrency、tests lanes、timeout、fuzz 動態矩陣）一併不跟進。驗證責任由 release 各 build job 自帶 gates 承擔。若日後想恢復 CI，把基底原樣取回即可（noavx 無需修改 ci 內容）。
 
 ### 2.5 其餘上游漂移（本目錄跟隨，不改 noavx 語義）
 
@@ -100,14 +95,11 @@
 
 - 版本無關，直接沿用 _400（4.2.5 build.rs ONNX 段未變：同為官方 v1.24.2、`vendor/onnx/libonnxruntime.so` 路徑、已存在則早退；腳本 `ORT_TAG=rel-1.24.2` 與之對應）。
 
-### .github/workflows/ci.yml（上游即此路徑）
-
-- _400 結構（Linux-only + `noavx-check` job + supply-chain/fuzz 原樣保留）+ port 上游 4.2.5 四處（見第 2.3–2.4 節）：nightly schedule + dispatch、per-SHA concurrency、Test timeout 60（full-lane 語義）、fuzz 動態矩陣。
-- build-test 用 `--features ocr,rerank,http` + nextest + `ci` profile；QEMU 段只跑 doctor 探針（`RUSTFLAGS="-C target-cpu=x86-64"`，斷言 "shared library loaded"），best-effort。
+### .github/workflows/ci.yml → 已刪除不攜帶（見第 2.4 節）
 
 ### .github/workflows/release.yml
 
-- _400 結構原樣（Linux-only build job + `build-noavx-linux` + payload gates + `.so` floor TODO + QEMU doctor probe + `_sync` 容忍 + publish `needs: [build, build-noavx-linux]`），僅版本引用 `v4.0.0_sync`→`v4.2.5_sync`、`[4.0.0]`→`[4.2.5]`，另加第 2.2 節的 NO_UPDATE_CHECK env（兩個 Verify 步驟）與第 2.3 節的 Wait-for-CI gate（僅 publish 前，build jobs 不加）。
+- _400 結構原樣（Linux-only build job + `build-noavx-linux` + payload gates + `.so` floor TODO + QEMU doctor probe + `_sync` 容忍 + publish `needs: [build, build-noavx-linux]`），僅版本引用 `v4.0.0_sync`→`v4.2.5_sync`、`[4.0.0]`→`[4.2.5]`，另加第 2.2 節的 NO_UPDATE_CHECK env（兩個 Verify 步驟）；第 2.3 節的 Wait-for-CI gate **已移除不跟進**（見該節）。
 - 版本驗證剝 `${TAGVER%%_*}` 後綴；release notes 三級降級不中斷（上游 4.2.5 原版此處仍是硬失敗 `sys.exit`，必須保留容忍修復）。
 
 ### 上游新增但 overlay 不攜帶：npm-publish.yml、stealth.yml
@@ -127,8 +119,8 @@
   ```bash
   diff -r donsetch_noavx_425 donsetch_noavx_400   # 預期差異只有：第 2 節的上游漂移（更名/version.rs update-check/concurrency+gate/ci lanes+timeout+features 註解+profile.fast/README 重寫/CONTRIBUTING just 化/doctor 其他段）、版本号引用、TESTING 兩處更新、workflows 回到 .github/（沿用）；其餘應無差異
   python3 -c "import tomllib; tomllib.load(open('donsetch_noavx_425/Cargo.toml','rb'))"
-  python3 -c "import yaml; yaml.safe_load(open('donsetch_noavx_425/.github/workflows/ci.yml'))"
   python3 -c "import yaml; yaml.safe_load(open('donsetch_noavx_425/.github/workflows/release.yml'))"
+  test ! -e donsetch_noavx_425/.github/workflows/ci.yml   # ci.yml 已刪除（見第 2.4 節）
   grep -rn "dondai44423" donsetch_noavx_425/   # 應只剩 README 的 bladebro 段與 dsh 段、CONTRIBUTING 的 Reviewers 表格與本文件記錄原始值處
   # 另以 grep 確認全 overlay 無舊拼寫前綴殘留（少一個 T 的版本；本文件以代稱敘述，刻意不寫字面，以免自我匹配）
   find donsetch_noavx_425/src -type f          # 必須恰好 5 個檔案（rollback.rs 必須不在內）
@@ -156,7 +148,7 @@
 - **退役的 patch 不刪除歷史記錄**：_400 目錄保留原樣，本目錄不再攜帶上游已修的 SIBLING 段；來龍去脈見 _400 的 NOAVX_MODIFICATIONS.md 第 2 節。
 - **README 開頭 AVX 警告用詞**：**定案（用戶決定）：gate 停用表述**——load-dynamic 下實際行為是 gate 停用 OCR/rerank、主程式正常運行（「standard binary 仍可運行，但 OCR/rerank 被 gate 停用」及「silently disabled」bullet）。
 - **npm-publish.yml / stealth.yml 不攜帶**：fork 沿用基底原樣（用戶決策，見第 3 節）。
-- **Wait-for-CI gate 只放 publish 前**：跟隨上游佈局，`build-noavx-linux` 不加（用戶決策）。
+- **Wait-for-CI gate 已移除不跟進**：fork 只同步版本快照，不保證 tag 前有 master push 的 CI run，gate 會空轉 ~30 分鐘後擋掉每次發版（實測確認）。驗證責任由各 build job 自帶 gates 承擔（用戶決策，見第 2.3 節）。
 - **README 的 CI 平台描述句改為 Linux-only**：4.2.5 README 兩處 "full matrix on Linux, macOS and Windows / three platforms" 已改為 Linux x86_64 描述（**定案，用戶決定**）——fork 只建 Linux，維持上游原文屬事實不符。
 - **上游 `heavy` CI job 不 port**：多平台矩陣範疇，fork 保持 Linux-only；nightly 重跑同一 Linux suite（見第 2.4 節）。
 
