@@ -1,0 +1,2471 @@
+//! `donsetch --doctor` : health check with auto-fix.
+//!
+//! Checks, each with a clean pass/warn/fail icon and a dim
+//! detail string. Auto-fixes what it can (creates missing dirs,
+//! removes stale lock files). Prints instructions for issues that
+//! need manual intervention.
+//!
+//! The browser path must be BORING to install (50-case report):
+//! doctor proves Chromium presence, Xvfb, a REAL browser launch
+//! with fingerprint selftest, and model availability. A tier-2
+//! feature that only works when the user guesses a hidden
+//! prerequisite is not finished, and doctor is where that
+//! prerequisite surfaces.
+
+use std::path::Path;
+
+use crate::DISPLAY_NAME;
+use crate::cli;
+use crate::fetch::client::Fetcher;
+use crate::paths;
+use crate::profile::BrowserProfile;
+
+#[derive(Debug)]
+enum CheckResult {
+    Pass(String),
+    Warn(String),
+    Fail(String, String), // (detail, instructions)
+    Fixed(String),
+}
+
+pub async fn run() {
+    cli::init();
+
+    // Flags: --json (structured output for agents/CI), --deep
+    // (full live-probe suite), --fix (apply safe repairs after the
+    // checks), --fast (default: skip slow probes). --mcp prints
+    // MCP client registration blocks for any detected client.
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let json = args.iter().any(|a| a == "--json");
+    let deep = args.iter().any(|a| a == "--deep");
+    let fix = args.iter().any(|a| a == "--fix");
+    let only_mcp = args.iter().any(|a| a == "--mcp");
+    let improve = args.iter().any(|a| a == "--improve");
+    let stealth_record = args.iter().any(|a| a == "--stealth-record");
+    let stealth = args.iter().any(|a| a == "--stealth") || stealth_record;
+    let parity = args.iter().any(|a| a == "--parity");
+
+    // --improve: explain the self-improvement loop in ~10 lines.
+    // Standalone mode; no MCP tool, no network.
+    if improve {
+        print_improve_loop();
+        std::process::exit(0);
+    }
+
+    // --stealth / --stealth-record: the drift scorecard (v4 phase
+    // 0.4). Standalone mode: skips the general check battery.
+    // --parity (with --stealth, v4 phase 1.1): diff tier-1 against
+    // the REAL local browser instead of the fixture.
+    if stealth || stealth_record {
+        let code = stealth_scorecard(stealth_record, json, parity).await;
+        std::process::exit(code);
+    }
+
+    cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
+    println!();
+
+    let mut p = 0u32; // passed
+    let mut w = 0u32; // warnings
+    let mut f = 0u32; // failed
+    // (name, status, detail, hint) collected for --json and --fix.
+    let mut collected: Vec<(String, String, String, String)> = Vec::new();
+
+    macro_rules! report {
+        ($name:expr, $r:expr) => {
+            match $r {
+                CheckResult::Pass(d) => {
+                    collected.push(($name.to_string(), "pass".into(), d.clone(), String::new()));
+                    cli::check_pass($name, &d);
+                    p += 1;
+                }
+                CheckResult::Warn(d) => {
+                    collected.push(($name.to_string(), "warn".into(), d.clone(), String::new()));
+                    cli::check_warn($name, &d);
+                    w += 1;
+                }
+                CheckResult::Fail(d, i) => {
+                    collected.push(($name.to_string(), "fail".into(), d.clone(), i.clone()));
+                    cli::check_fail($name, &d, &i);
+                    f += 1;
+                }
+                CheckResult::Fixed(d) => {
+                    collected.push(($name.to_string(), "fixed".into(), d.clone(), String::new()));
+                    cli::check_fixed($name, &d);
+                    p += 1;
+                }
+            }
+        };
+    }
+
+    // 1. Binary integrity.
+    report!("Binary integrity", check_binary());
+
+    // Create fetcher for network and TLS checks.
+    let fetcher = match Fetcher::new(BrowserProfile::host_default()) {
+        Ok(fm) => Some(fm),
+        Err(e) => {
+            cli::check_fail(
+                "Fetcher init",
+                &e.to_string(),
+                "TLS initialization failed : check system CA certificates",
+            );
+            f += 1;
+            collected.push((
+                "Fetcher init".into(),
+                "fail".into(),
+                e.to_string(),
+                "TLS initialization failed : check system CA certificates".into(),
+            ));
+            None
+        }
+    };
+
+    // 2. Network reachability (always: it gates nothing else).
+    if let Some(ref fm) = fetcher {
+        report!("Network", check_network(fm).await);
+    } else {
+        report!(
+            "Network",
+            CheckResult::Warn("skipped: fetcher unavailable".to_string())
+        );
+    }
+
+    // 2b. Fetch egress + trust posture (local-only, always runs).
+    report!("Fetch egress", check_fetch_egress());
+
+    // 2c. Proxy pool + persisted lane health (local-only).
+    report!("Proxy pool", check_proxy_pool());
+
+    // 2d. Egress lanes: local health always; --deep live-probes
+    // every configured proxy and prints one line per lane.
+    report!("Egress lanes", check_egress_lanes(deep).await);
+
+    // 3. TLS fingerprint (fast enough to keep in fast mode).
+    if let Some(ref fm) = fetcher {
+        report!("TLS fingerprint", check_tls(fm).await);
+    }
+
+    // 4. Chrome/Chromium.
+    report!("Chrome/Chromium", check_chrome().await);
+
+    // 5. Xvfb (Linux headful stealth prerequisite).
+    report!("Xvfb", check_xvfb());
+
+    // 6. Ghost profile.
+    report!("Ghost profile", check_ghost_profile());
+
+    // 7. Browser launch: the only heavyweight probe. Fast mode
+    // (default) skips the seconds-long live launch; --deep runs it.
+    if deep {
+        report!("Browser launch", check_browser_launch().await);
+        // Captive portal: generate_204 must stay 204. A hotel/airport
+        // login page answering 200/302 is the classic "TLS works but
+        // every fetch is a login form" failure.
+        report!(
+            "Captive portal",
+            check_captive_portal(fetcher.as_ref()).await
+        );
+    } else {
+        cli::check_dim("Browser launch", "skipped (--deep to run)");
+        cli::check_dim("Captive portal", "skipped (--deep to run)");
+    }
+
+    // 8. Cache directory.
+    report!("Cache directory", check_cache_dir());
+
+    // 8b. Auth sessions (donsetch login).
+    report!("Auth sessions", check_auth_sessions());
+
+    // 9. State permissions.
+    report!("State permissions", check_state_permissions());
+
+    // 10. PDFium.
+    report!("PDFium", check_pdfium());
+
+    // 11. OCR models.
+    report!("OCR models", check_ocr_models());
+
+    // 12. Rerank model.
+    report!("Rerank model", check_rerank_model());
+
+    // 13. ONNX Runtime / AVX.
+    report!("ONNX Runtime", check_onnx());
+
+    // 14. Ghost state.
+    report!("Ghost state", check_ghost_state());
+
+    // 15. Bright Data account keys (SERP + unlocker): the paid
+    // layer gets more than a y/n. Default mode validates locally
+    // (presence, shape, cap + cache state, kill switches); --deep
+    // adds a free live zone probe (route_ips costs nothing).
+    report!("Bright Data SERP", check_brightdata());
+    report!("Bypass unlocker", check_bypass(deep));
+
+    // 15.5 BYOK plugins (user-registered executable adapters).
+    report!("Search plugins", check_plugins());
+
+    // 16. Config posture: layer conflicts, missing files, redaction.
+    report!("Config posture", check_config_posture());
+
+    // 17. Search health snapshot (local, fast): trust, quarantine,
+    // quality/outcome receipts, BYOK key states, C kill switches.
+    report!("Search health", check_search_health());
+
+    // 18. Clearance stores: routes.json, handles, cookie vault.
+    report!("Clearance stores", check_clearance_stores());
+
+    // 19. Crawl stores: governor persist, page-history size.
+    report!("Crawl stores", check_crawl_stores());
+
+    // 20. Network reality: DNS + optional captive-portal probe.
+    report!("DNS", check_dns());
+
+    // 21. MCP client registration (detect + print blocks).
+    print_mcp_section();
+
+    // 22. Legacy env vars (the pre-v4 names): still honored, but
+    // each one active in this shell gets ONE warning naming its
+    // config key. Cut at the v4 release.
+    let legacy: Vec<&'static str> = crate::config::legacy_vars_in_env();
+    if legacy.is_empty() {
+        report!("Legacy env vars", CheckResult::Pass("none set".to_string()));
+    } else {
+        let names: Vec<String> = legacy
+            .iter()
+            .map(|name| {
+                let (section, key) = crate::config::legacy_target_of(name);
+                format!("{name} -> {section}.{key}")
+            })
+            .collect();
+        report!(
+            "Legacy env vars",
+            CheckResult::Warn(format!("{} (deprecated, cut at v4)", names.join(", ")))
+        );
+    }
+
+    // ── Self-healing pass (--fix) ───────────────────────────
+    if fix {
+        println!();
+        let _ = apply_fixes(&mut collected).await;
+    }
+
+    // ── Summary ──────────────────────────────────────────────
+    println!();
+    let total = p + w + f;
+    println!("  {p}/{total} passed, {w} warning(s), {f} failed");
+    cli::print_footer();
+
+    if f > 0 {
+        println!("  Status: {}", cli::red("issues found"));
+    } else if w > 0 {
+        println!("  Status: {}", cli::yellow("healthy with warnings"));
+    } else {
+        println!("  Status: {}", cli::green("healthy"));
+    }
+
+    // JSON goes LAST so tail-parsers get exactly one clean document.
+    if json {
+        print_json_summary(&collected, p, w, f, deep);
+    }
+    if only_mcp {
+        std::process::exit(0);
+    }
+    // Scripts gate on the exit code: doctor failing must not read
+    // as success.
+    if f > 0 {
+        std::process::exit(1);
+    }
+}
+
+// ── Individual checks ──────────────────────────────────────────
+
+fn check_binary() -> CheckResult {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return CheckResult::Fail("cannot determine path".into(), e.to_string()),
+    };
+
+    let meta = match std::fs::metadata(&exe) {
+        Ok(m) => m,
+        Err(e) => return CheckResult::Fail("not accessible".into(), e.to_string()),
+    };
+
+    let size = meta.len();
+    if size < 1_000_000 {
+        return CheckResult::Fail(
+            format!("{size} bytes (suspiciously small)"),
+            "Binary may be corrupt. Reinstall donsetch.".into(),
+        );
+    }
+
+    CheckResult::Pass(format!(
+        "v{}, {}MB",
+        env!("CARGO_PKG_VERSION"),
+        size / 1_000_000,
+    ))
+}
+
+async fn check_network(fetcher: &Fetcher) -> CheckResult {
+    let generic = match fetcher.fetch("https://example.com").await {
+        Ok(out) if out.status == 200 => out,
+        Ok(out) => return CheckResult::Warn(format!("example.com returned HTTP {}", out.status)),
+        Err(e) => {
+            // Egress-filter environments are the one common case
+            // where a "network is fine" box still fails every
+            // fetch: curl works via the env proxy, direct sockets
+            // get reset. Surface the fix instead of a generic
+            // "check your connection".
+            // The advice must match what the daemon actually does:
+            // a proxy comes from the ambient env vars OR the [proxy]
+            // slots in donsetch.toml (from_env_for consults the
+            // config layer first; the pool lane adds proxy.pool).
+            let proxy_configured = [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]
+            .iter()
+            .any(|v| std::env::var_os(v).is_some())
+                || {
+                    let p = &crate::config::cfg().proxy;
+                    !p.https.trim().is_empty()
+                        || !p.http.trim().is_empty()
+                        || !p.all.trim().is_empty()
+                        || !p.pool.is_empty()
+                };
+            let hint = if proxy_configured {
+                "A proxy is configured (env vars or [proxy] in donsetch.toml) and the direct fetch still failed: this looks like a TLS-intercepting egress network. donsetch honors it automatically (see 'Fetch egress'); if it still fails, export SSL_CERT_FILE=<the network's CA bundle> or set [tls] cert_file in donsetch.toml so the re-signed certificates verify, then re-run doctor."
+                    .to_string()
+            } else {
+                "Check your network connection and DNS. Behind an egress proxy? Set [proxy] https/http in donsetch.toml or export HTTPS_PROXY/HTTP_PROXY (NO_PROXY accepted).".into()
+            };
+            return CheckResult::Fail(e.to_string(), hint);
+        }
+    };
+    // The tool lane is a SEPARATE call chain into the same dialer:
+    // fetch_persona, the tier-1 navigation identity that every MCP
+    // web_fetch and CLI fetch rides. Probing it here is what makes this
+    // line a prediction of tool behaviour instead of a prediction of the
+    // update check: a bug that broke only the persona lane once had this
+    // check report healthy egress while every tool call failed, and the
+    // misdiagnosis sent the report to the deployment instead of here.
+    // fetch_persona reports no timing of its own (elapsed is zero on that
+    // path), so only the generic lane's RTT is quoted.
+    match fetcher.fetch_persona("https://example.com", None).await {
+        Ok(t) if t.status == 200 => CheckResult::Pass(format!(
+            "example.com 200 OK ({:.0}ms, generic and tool lanes)",
+            generic.elapsed.as_secs_f64() * 1000.0,
+        )),
+        Ok(t) => CheckResult::Warn(format!(
+            "example.com: the generic lane got HTTP {} but the tool lane (web_fetch) got HTTP {}",
+            generic.status, t.status
+        )),
+        Err(e) => CheckResult::Warn(format!(
+            "example.com: the generic lane reached it but the tool lane (web_fetch) failed: {e}"
+        )),
+    }
+}
+
+/// Fetch egress + trust posture: env-proxy resolution, kill switch,
+/// and the two certificate stores the connector builds from.
+/// Local-only: no network, stays in fast mode.
+fn check_fetch_egress() -> CheckResult {
+    let proxy = &crate::config::cfg().proxy;
+    let slot_set = !proxy.https.trim().is_empty()
+        || !proxy.http.trim().is_empty()
+        || !proxy.all.trim().is_empty();
+    // from_env_for already consults the [proxy] slots first and
+    // gates only the ambient env read on from_environment: call it
+    // unconditionally so the doctor's view matches the daemon's
+    // (a TOML proxy with from_environment = false used to be
+    // reported as direct egress).
+    let resolved = crate::transport::proxy::from_env_for("https://example.com");
+    let (sys_roots, env_roots) = crate::transport::tls::trust_store_report();
+    let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
+
+    let mut bits = Vec::new();
+    if let Some(p) = resolved {
+        bits.push(format!("egress via {} proxy {}:{} ({}; SOCKS5 keeps TLS end-to-end, HTTP CONNECT gets the interception-safe handshake)", if p.is_http_connect() { "http" } else { "socks5" }, p.host, p.port, if slot_set { "config" } else { "env" }));
+    } else {
+        bits.push(if !proxy.from_environment {
+            "direct egress (proxy.from_environment = false disables the env-proxy convention; [proxy] slots in donsetch.toml stay live)"
+                .into()
+        } else {
+            "direct egress (no proxy env vars; export HTTPS_PROXY/HTTP_PROXY to route fetches)"
+                .into()
+        });
+    }
+    match cert_bundle {
+        Some(b) => {
+            if env_roots > 0 {
+                bits.push(format!(
+                    "trust: {sys_roots} system roots + {env_roots} from {b}"
+                ));
+                CheckResult::Pass(bits.join(" · "))
+            } else {
+                bits.push(format!("trust: {sys_roots} system roots; {b} set but yielded no parseable certs (the interception CA will NOT be trusted)"));
+                CheckResult::Warn(bits.join(" · "))
+            }
+        }
+        None => {
+            bits.push(format!(
+                "trust: {sys_roots} system roots; SSL_CERT_FILE unset"
+            ));
+            CheckResult::Pass(bits.join(" · "))
+        }
+    }
+}
+
+/// Proxy pool size + persisted egress-health.json (search/fetch lane
+/// burn memory). Local-only: reads config and the health file, no
+/// network. Named fix when every proxy lane is currently benched.
+fn check_proxy_pool() -> CheckResult {
+    let proxy = &crate::config::cfg().proxy;
+    let pool_n = proxy.pool.iter().filter(|s| !s.trim().is_empty()).count();
+    let persist = proxy.egress_persist && !crate::config::cfg().state.no_disk_state;
+    let mut bits = Vec::new();
+    if pool_n == 0 {
+        bits.push("pool empty (DONSEEK_PROXIES or [proxy] pool; direct-only egress)".to_string());
+    } else {
+        bits.push(format!("{pool_n} proxy lane(s) configured"));
+    }
+    bits.push(if persist {
+        "egress health persisted".into()
+    } else {
+        "egress health NOT persisted (proxy.egress_persist=false or state.no_disk_state)".into()
+    });
+
+    if !persist {
+        return CheckResult::Pass(bits.join(" · "));
+    }
+
+    let path = paths::cache_dir().join("egress-health.json");
+    if !path.exists() {
+        bits.push("no egress-health.json yet (benches appear after the first burn)".into());
+        return CheckResult::Pass(bits.join(" · "));
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            bits.push(format!("egress-health.json unreadable: {e}"));
+            return CheckResult::Warn(bits.join(" · "));
+        }
+    };
+    let burned = raw.matches("\"burned\"").count();
+    let dead_n: usize = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("dead").and_then(|d| d.as_array()).map(|a| a.len()))
+        .unwrap_or(0);
+
+    if pool_n > 0 && dead_n >= pool_n {
+        bits.push(format!(
+            "all {pool_n} proxy lane(s) benched in egress-health.json: run `donsetch proxy check` and fix creds/network"
+        ));
+        return CheckResult::Warn(bits.join(" · "));
+    }
+    bits.push(format!(
+        "learned benches: {burned} burned pair marker(s), {dead_n} dead lane(s)"
+    ));
+    CheckResult::Pass(bits.join(" · "))
+}
+
+/// `donsetch doctor --improve`: the self-improvement loop in plain
+/// language + live local receipts. No MCP tool, no network.
+fn print_improve_loop() {
+    cli::print_title(&format!("{DISPLAY_NAME} Improve"));
+    println!();
+    println!("  DonSeTch learns from YOUR use of it, on this machine only.");
+    println!("  Nothing leaves the box. No telemetry, no cloud model.");
+    println!();
+    println!("  What it remembers");
+    println!("    · per-host walls, cookie freshness, solve cooldowns");
+    println!("    · per-(engine, intent) search trust EWMAs");
+    println!("    · domain quality from enrich success (tiny rank prior)");
+    println!("    · agent-outcome demotes (must_contain miss / thin pages)");
+    println!("    · proxy lane health + RTT (search / fetch / crawl share it)");
+    println!("    · crawl host ladders (429 storms, robots delays)");
+    println!();
+    println!("  What it does with that");
+    println!("    · skips doomed tier-1 hits and dead egress lanes");
+    println!("    · orders engines by what worked for THIS intent");
+    println!("    · nudges ranking toward hosts that historically enrich clean");
+    println!("    · soft-demotes hosts that failed your own verification");
+    println!("    · warms top results so your next web_fetch is near-instant");
+    println!("    · fails fast (honest) instead of burning a browser cycle");
+    println!();
+    let state = crate::ghost::cache::GhostState::load();
+    let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
+    let (t, ti, f) = crate::search::persist_load_for_status();
+    let low = t.values().filter(|&&x| x < 0.5).count() + ti.values().filter(|&&x| x < 0.5).count();
+    let warm_hits = state.pool_served_total + state.prewarmed_served_total;
+    let (q_hosts, q_high, q_low) = crate::search::persist_load_quality_for_status();
+    let (o_keys, o_demoted) = crate::search::persist_load_outcome_for_status();
+    cli::print_kv("receipts", "");
+    println!("    hosts {hosts} · walled {walled} · warm-ready {warm} · warm-hits {warm_hits}");
+    println!(
+        "    cooldowns {cooldowns} · flaky {flaky} · probes {} · engine trust {}/{} low",
+        state.probes_total,
+        low,
+        t.len() + ti.len()
+    );
+    println!(
+        "    quarantined engines {f} · quality hosts {q_hosts} ({q_high} high / {q_low} low)",
+        f = f.len()
+    );
+    println!(
+        "    outcome keys {o_keys} ({o_demoted} demoted) · outcome_feedback {}",
+        if crate::config::cfg().search.outcome_feedback {
+            "on"
+        } else {
+            "off (default; enable search.outcome_feedback)"
+        }
+    );
+    println!();
+    println!("  Kill switches");
+    println!("    state.route_memory=off     forget host/persona learning");
+    println!("    DONSETCH_NO_EGRESS_PERSIST forget lane health");
+    println!("    DONSETCH_NO_PREWARM        stop search→fetch warm handoff");
+    println!("    DONSETCH_NO_QUALITY_PRIOR  stop the learned domain rank nudge");
+    println!("    search.outcome_feedback=off  agent-outcome demotes (default)");
+    println!();
+    println!("  Battle-test before any public claim: 24h soak under bench/improve/.");
+    cli::print_footer();
+}
+
+/// Egress fabric lanes (v4 A2). Fast mode: local health summary
+/// from the shared pool / persisted file. --deep: live-probe every
+/// configured proxy (connect + small GET) and name the fix.
+async fn check_egress_lanes(deep: bool) -> CheckResult {
+    let pool = crate::search::egress::global()
+        .unwrap_or_else(|| std::sync::Arc::new(crate::search::egress::EgressPool::from_env()));
+    let summary = pool.lane_summary();
+    if summary.is_empty() || (summary.len() == 1 && summary[0].is_direct) {
+        return CheckResult::Pass(
+            "direct-only egress (no proxy pool; search/crawl/fetch share the home IP)".into(),
+        );
+    }
+    let mut bits: Vec<String> = Vec::new();
+    let mut bad = 0usize;
+    for row in &summary {
+        let name = if row.is_direct { "direct" } else { &row.id };
+        let rtt = row
+            .rtt_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".into());
+        let persona = row
+            .persona_host
+            .as_deref()
+            .map(|h| format!(" persona={h}"))
+            .unwrap_or_default();
+        let mut line = format!("{name}: {} rtt={rtt}{persona}", row.state);
+        if matches!(row.state.as_str(), "dead" | "auth" | "burned") {
+            bad += 1;
+            if row.state == "auth" {
+                line.push_str(" · fix: `donsetch proxy test <url>` then update credentials");
+            } else {
+                line.push_str(" · fix: `donsetch proxy check`; replace dead lines");
+            }
+        }
+        bits.push(line);
+    }
+
+    if deep {
+        let proxies = pool.proxies();
+        if !proxies.is_empty() {
+            let results = crate::cli::proxy::probe_all(&proxies).await;
+            let mut dead = 0usize;
+            let mut slow = 0usize;
+            for (px, r) in proxies.iter().zip(results.iter()) {
+                if r.alive {
+                    pool.observe_rtt(&px.id(), r.latency);
+                    if r.latency.as_millis() as u64
+                        >= crate::search::egress::EgressPool::slow_rtt_ms() as u64
+                    {
+                        slow += 1;
+                        bits.push(format!(
+                            "{}: live slow {} (exit {})",
+                            px.id(),
+                            r.latency.as_millis(),
+                            r.exit_ip.as_deref().unwrap_or("?")
+                        ));
+                    }
+                } else {
+                    dead += 1;
+                    pool.report_dead(&px.id());
+                    bits.push(format!(
+                        "{}: live dead · {}",
+                        px.id(),
+                        r.error.as_deref().unwrap_or("probe failed")
+                    ));
+                }
+            }
+            // All dead = probe endpoint died, not the pool.
+            if !proxies.is_empty() && dead == proxies.len() {
+                pool.revive_all();
+                bits.push(
+                    "all lanes failed the live probe (likely api.ipify.org down); benches cleared"
+                        .into(),
+                );
+                return CheckResult::Warn(bits.join(" · "));
+            }
+            if dead > 0 {
+                return CheckResult::Fail(
+                    bits.join(" · "),
+                    "replace or repair the dead proxy lines, then re-run doctor --deep".into(),
+                );
+            }
+            if slow > 0 {
+                return CheckResult::Warn(bits.join(" · "));
+            }
+        }
+    }
+
+    if bad > 0 {
+        return CheckResult::Warn(bits.join(" · "));
+    }
+    CheckResult::Pass(bits.join(" · "))
+}
+
+async fn check_tls(fetcher: &Fetcher) -> CheckResult {
+    match fetcher.fetch("https://tls.peet.ws/api/all").await {
+        Ok(out) if out.status == 200 => {
+            let body = String::from_utf8_lossy(&out.body);
+            // Parse JA4 from JSON: "ja4": "t13d..."
+            // The value may have whitespace after the colon.
+            if let Some(pos) = body.find("\"ja4\":") {
+                let rest = body[pos + 6..].trim_start();
+                if let Some(rest) = rest.strip_prefix('"')
+                    && let Some(end) = rest.find('"')
+                {
+                    let ja4 = &rest[..end];
+                    if ja4.starts_with("t13d") {
+                        return CheckResult::Pass(format!("JA4: {ja4}"));
+                    }
+                }
+            }
+            CheckResult::Pass("TLS connection successful".into())
+        }
+        Ok(_) => {
+            // External service returned non-200 : skip silently.
+            // The TLS stack works (we connected); the fingerprint
+            // check service is just unavailable. Don't alarm users.
+            CheckResult::Pass("TLS connected (fingerprint service unavailable)".into())
+        }
+        Err(_) => {
+            // Can't reach the fingerprint service at all. Still
+            // don't warn : the service may be down or blocked,
+            // and the TLS stack is fine (we use it for every fetch).
+            CheckResult::Pass("TLS stack active (fingerprint service unreachable)".into())
+        }
+    }
+}
+
+async fn check_chrome() -> CheckResult {
+    let result = tokio::task::spawn_blocking(crate::ghost::resolve_browser).await;
+    match result {
+        Ok(Ok(browser)) => {
+            // Full dotted build, not just the major: probing the
+            // exact binary we resolved (backed identical for
+            // chromium and cloak) costs one spawn and is the only
+            // number that matters for debugging detection issues.
+            // A padded "151.0.0.0" was honest but vague.
+            let version =
+                crate::profile::probe_version_string_at_path(&browser.path.to_string_lossy())
+                    .or_else(|| browser.version.clone())
+                    .unwrap_or_else(|| "unknown version".into());
+            CheckResult::Pass(format!(
+                "{} at {} ({}; {})",
+                version,
+                browser.path.display(),
+                browser.backend.as_str(),
+                browser.source
+            ))
+        }
+        Ok(Err(error)) => CheckResult::Fail(
+            error.to_string(),
+            "Install Chromium, set DONGHOST_CHROME, or set CLOAKBROWSER_BINARY_PATH. ".to_string()
+                + "Set DONSETCH_CLOAK_AUTO_DOWNLOAD=1 to fetch the signed CloakBrowser binary.",
+        ),
+        Err(error) => CheckResult::Fail(
+            format!("browser resolution task failed: {error}"),
+            "Retry the check; browser resolution could not be started.".into(),
+        ),
+    }
+}
+
+/// Xvfb: the Linux headful-stealth prerequisite. Missing Xvfb
+/// does NOT disable tier 2 : ghost falls back to off-screen
+/// headful on the real display (a window may flash briefly) or
+/// headless on Wayland-only sessions (more detectable). Warn,
+/// not fail : but the user deserves to know.
+fn check_xvfb() -> CheckResult {
+    #[cfg(linux_like)]
+    {
+        // A forced headless backend deliberately does not need Xvfb.
+        if crate::ghost::cloak::headless_mode_requested() {
+            return CheckResult::Pass("not needed (headless backend)".into());
+        }
+        // Termux (Android) has no X11 by default. Xvfb is not
+        // needed : Ghost uses --headless=new mode.
+        if std::env::var_os("PREFIX")
+            .map(|p| p.to_string_lossy().contains("com.termux"))
+            .unwrap_or(false)
+        {
+            return CheckResult::Pass("not needed (Termux : headless mode)".into());
+        }
+        if crate::ghost::xvfb::is_available() {
+            // :99 socket alive = daemon's Xvfb will be reused.
+            let reuse = std::path::Path::new("/tmp/.X11-unix/X99").exists();
+            CheckResult::Pass(if reuse {
+                "available, display :99 alive (reused)".into()
+            } else {
+                "available (starts on demand)".into()
+            })
+        } else {
+            CheckResult::Warn(
+                "not installed : tier 2 falls back to headless/off-screen (less stealthy)".into(),
+            )
+        }
+    }
+    #[cfg(not(linux_like))]
+    {
+        CheckResult::Pass("not needed on this platform".into())
+    }
+}
+/// The REAL browser test: launch Chromium exactly as tier 2
+/// would (same flags, same Xvfb dance), run the fingerprint
+/// selftest page, kill. Bounded to 40s. This is what turns
+/// the 50-case report's "a feature that works only when the
+/// user guesses the hidden prerequisite is not finished".
+async fn check_browser_launch() -> CheckResult {
+    let inner = async {
+        // Same Xvfb handling as GhostManager: start/reuse :99.
+        let xvfb = if crate::ghost::cloak::headless_mode_requested() {
+            None
+        } else {
+            crate::ghost::xvfb::Xvfb::start().await.ok()
+        };
+        let display = xvfb.as_ref().map(|x| x.display_env());
+        let profile = BrowserProfile::host_default();
+        let t0 = std::time::Instant::now();
+        let mut ghost = match crate::ghost::Ghost::launch(&profile, display.as_deref()).await {
+            Ok(g) => g,
+            Err(e) => {
+                if let Some(x) = xvfb {
+                    x.kill().await;
+                }
+                return CheckResult::Fail(
+                    format!("launch failed: {e}"),
+                    "Tier 2 browser fallback will not work. Install Chromium/Xvfb, set DONGHOST_CHROME, or configure CloakBrowser with CLOAKBROWSER_BINARY_PATH.".into(),
+                );
+            }
+        };
+        let launch_ms = t0.elapsed().as_millis();
+
+        let fp = crate::ghost::ops::selftest(&mut ghost).await;
+        ghost.kill().await;
+        if let Some(x) = xvfb {
+            x.kill().await;
+        }
+        match fp {
+            Ok(json_str) => {
+                let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+                // Real-Chrome parity: webdriver must be false VIA THE
+                // NATIVE ACCESSOR with no own property on the
+                // navigator instance (an injected own property is a
+                // tell). undefined was pre-Chrome-89 behavior.
+                let webdriver = v.get("webdriver").and_then(|w| w.as_bool());
+                let no_own_prop =
+                    v.get("webdriverOwnProp").and_then(|w| w.as_bool()) == Some(false);
+                // WebGL null is a headless-only signature: it fires
+                // when the host cannot provide any GL (common on
+                // GPU-less Linux + a Chromium build without a
+                // working software rasterizer). Windows/macOS and
+                // GPU Linux report a real renderer and clear this.
+                // Warn, do not fail: the browser still works, and
+                // the SwiftShader launch flags enable it whenever
+                // the host can.
+                let gl_ok = v
+                    .get("webglRenderer")
+                    .and_then(|w| w.as_str())
+                    .is_some_and(|r| !r.is_empty() && r != "?" && r != "err" && r != "undefined");
+                let deep_clean = webdriver == Some(false)
+                    && no_own_prop
+                    && v.get("hasChrome").and_then(|x| x.as_bool()) == Some(true)
+                    && v.get("plugins")
+                        .and_then(|x| x.as_u64())
+                        .is_some_and(|n| n > 0)
+                    && v.get("ua")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|ua| !ua.contains("HeadlessChrome"));
+                let gl_note = if gl_ok {
+                    format!(
+                        "webgl={}",
+                        v.get("webglRenderer")
+                            .and_then(|w| w.as_str())
+                            .unwrap_or("ok")
+                    )
+                } else {
+                    "webgl=null (host provides no GL; software renderer unavailable in this Chromium build)"
+                        .to_string()
+                };
+                if deep_clean && gl_ok {
+                    CheckResult::Pass(format!(
+                        "launched in {launch_ms}ms, deep fingerprint clean (webdriver=false native, no own prop, {gl_note})"
+                    ))
+                } else if deep_clean {
+                    CheckResult::Warn(format!(
+                        "launched in {launch_ms}ms, fingerprint clean EXCEPT {gl_note}"
+                    ))
+                } else {
+                    CheckResult::Warn(format!(
+                        "launched in {launch_ms}ms, deep fingerprint incomplete: webdriver={webdriver:?} ownProp={:?}, gl={:?}, chrome={:?}, plugins={:?}",
+                        v.get("webdriverOwnProp"),
+                        v.get("webglRenderer"),
+                        v.get("hasChrome"),
+                        v.get("plugins")
+                    ))
+                }
+            }
+            Err(e) => CheckResult::Warn(format!(
+                "launched in {launch_ms}ms, deep fingerprint selftest failed: {e}"
+            )),
+        }
+    };
+    // Hard bound: a wedged browser here must not hang doctor.
+    match tokio::time::timeout(std::time::Duration::from_secs(40), inner).await {
+        Ok(r) => r,
+        Err(_) => CheckResult::Fail(
+            "launch timed out after 40s".into(),
+            if cfg!(target_os = "linux") {
+                "A stale Chromium or Xvfb may be wedged: pkill -f chromium; rm -f /tmp/.X99-lock /tmp/.X11-unix/X99".into()
+            } else {
+                "A stale Chromium may be wedged: close all browser windows / kill all chrome processes, then retry".into()
+            },
+        ),
+    }
+}
+
+/// Session-bearing state must not be world-readable. Covers the
+/// cookie vault (ghost-state.json) and the TLS-session routes file.
+fn check_state_permissions() -> CheckResult {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = paths::cache_dir();
+        // Files that carry cookies, TLS sessions, or auth material.
+        // handles.json is opaque tokens, not secrets: leave it out.
+        let secret_files = ["ghost-state.json", "routes.json", "byok-keys.json"];
+        let mut fixed = Vec::new();
+        let mut failed = Vec::new();
+        let mut present = 0u32;
+        for name in secret_files {
+            let f = dir.join(name);
+            if !f.exists() {
+                continue;
+            }
+            present += 1;
+            let Ok(m) = std::fs::metadata(&f) else {
+                continue;
+            };
+            let mode = m.permissions().mode() & 0o777;
+            if mode & 0o077 == 0 {
+                continue;
+            }
+            let mut perm = m.permissions();
+            perm.set_mode(0o600);
+            if std::fs::set_permissions(&f, perm).is_ok() {
+                fixed.push(format!("{name} {mode:o}→600"));
+            } else {
+                failed.push(format!("{name} is {mode:o}"));
+            }
+        }
+        if !failed.is_empty() {
+            return CheckResult::Fail(
+                failed.join(", "),
+                format!(
+                    "chmod 600 {}",
+                    failed
+                        .iter()
+                        .map(|s| s.split_whitespace().next().unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            );
+        }
+        if !fixed.is_empty() {
+            return CheckResult::Fixed(format!("tightened {}", fixed.join(", ")));
+        }
+        if present == 0 {
+            return CheckResult::Pass("no secret-bearing state files yet".into());
+        }
+        CheckResult::Pass(format!("{present} secret store(s) at 600"))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: ACLs inherit from the user profile; we do not
+        // rewrite them. Presence is still worth reporting.
+        let dir = paths::cache_dir();
+        let present = ["ghost-state.json", "routes.json", "byok-keys.json"]
+            .iter()
+            .filter(|n| dir.join(n).exists())
+            .count();
+        CheckResult::Pass(format!(
+            "windows ACLs apply ({present} secret store(s) present)"
+        ))
+    }
+}
+
+/// Cross-encoder rerank model cache (semantic search reranking
+/// + focus filter). Missing = downloads on first search.
+fn check_rerank_model() -> CheckResult {
+    #[cfg(not(feature = "rerank"))]
+    {
+        CheckResult::Warn("not compiled (build with --features rerank to enable)".into())
+    }
+    #[cfg(feature = "rerank")]
+    {
+        let dir = paths::cache_dir().join("rerank");
+        if !dir.exists() {
+            return CheckResult::Warn("not cached (downloads on first search)".into());
+        }
+        let models = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .is_some_and(|ext| ext == "onnx" || ext == "json" || ext == "txt")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if models > 0 {
+            CheckResult::Pass(format!("{models} model files cached"))
+        } else {
+            CheckResult::Warn("not cached (downloads on first search)".into())
+        }
+    }
+}
+
+fn check_ghost_profile() -> CheckResult {
+    let dir = crate::ghost::profile_dir();
+
+    if !dir.exists() {
+        return match std::fs::create_dir_all(&dir) {
+            Ok(()) => CheckResult::Fixed("created profile directory".into()),
+            Err(e) => CheckResult::Fail("not found".into(), format!("Cannot create: {e}")),
+        };
+    }
+
+    // Check writable.
+    let test = dir.join(".doctor-write-test");
+    match std::fs::write(&test, b"test") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&test);
+
+            // Check for stale singleton lock files.
+            let mut stale = 0;
+            for f in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+                let p = dir.join(f);
+                if p.exists() {
+                    let _ = std::fs::remove_file(&p);
+                    stale += 1;
+                }
+            }
+
+            if stale > 0 {
+                CheckResult::Fixed(format!("removed {stale} stale lock(s)"))
+            } else {
+                CheckResult::Pass("writable, no stale locks".into())
+            }
+        }
+        Err(e) => CheckResult::Fail("not writable".into(), format!("Check permissions: {e}")),
+    }
+}
+
+fn check_auth_sessions() -> CheckResult {
+    let reg = crate::auth::AuthRegistry::load();
+    if reg.domains.is_empty() {
+        return CheckResult::Pass(
+            "no stored logins (use `donsetch login <domain>` to fetch gated sites)".into(),
+        );
+    }
+    let t = crate::ghost::cache::now();
+    let mut unverified = Vec::new();
+    let mut expiring = Vec::new();
+    for (d, s) in &reg.domains {
+        if s.verified == Some(false) {
+            unverified.push(d.clone());
+        }
+        // Session cookies (no expiry) never trip the near-expiry warn.
+        if let Some(min) = s.expires_min
+            && min > t
+            && min < t + 86_400
+        {
+            expiring.push(format!("{d} ({})", crate::auth::fmt_expiry(Some(min))));
+        }
+    }
+    let mut note = format!("{} domain(s) with stored sessions", reg.domains.len());
+    if !unverified.is_empty() {
+        note.push_str(&format!("; unverified: {}", unverified.join(", ")));
+    }
+    if !expiring.is_empty() {
+        note.push_str(&format!("; expiring soon: {}", expiring.join(", ")));
+    }
+    CheckResult::Pass(note)
+}
+
+fn check_cache_dir() -> CheckResult {
+    let dir = paths::cache_dir();
+
+    if !dir.exists() {
+        return match std::fs::create_dir_all(&dir) {
+            Ok(()) => CheckResult::Fixed("created cache directory".into()),
+            Err(e) => CheckResult::Fail("not found".into(), format!("Cannot create: {e}")),
+        };
+    }
+
+    let test = dir.join(".doctor-write-test");
+    match std::fs::write(&test, b"test") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&test);
+            let total = dir_size(&dir);
+
+            // Breakdown by component : helps users understand what's
+            // using space. The ghost-profile (Chrome's own cache) is
+            // typically the largest; ghost-state.json (self-improvement)
+            // should be < 1MB after cookie filtering.
+            let ghost_profile = dir.join("ghost-profile");
+            let ghost_state = dir.join("ghost-state.json");
+            let ocr = dir.join("ocr");
+            let rerank = dir.join("rerank");
+            let search_cache = dir.join("search-cache.json");
+
+            let parts = [
+                (
+                    "self-improvement",
+                    if ghost_state.exists() {
+                        ghost_state.metadata().map(|m| m.len()).unwrap_or(0)
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "ghost-profile",
+                    if ghost_profile.exists() {
+                        dir_size(&ghost_profile)
+                    } else {
+                        0
+                    },
+                ),
+                ("ocr-models", if ocr.exists() { dir_size(&ocr) } else { 0 }),
+                (
+                    "rerank-models",
+                    if rerank.exists() {
+                        dir_size(&rerank)
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "search-cache",
+                    if search_cache.exists() {
+                        search_cache.metadata().map(|m| m.len()).unwrap_or(0)
+                    } else {
+                        0
+                    },
+                ),
+            ];
+
+            let mut parts_vec: Vec<(&str, u64)> = parts.to_vec();
+            let known: u64 = parts_vec.iter().map(|(_, s)| *s).sum();
+            let other = total.saturating_sub(known);
+            // 'other' = vendored engine bits (PDFium static lib,
+            // ONNX runtime) staged in the cache dir: name them so
+            // nobody wonders where the bytes went.
+            if other >= 1_000_000 {
+                parts_vec.push(("engine-runtime", other));
+            }
+
+            let breakdown: String = parts_vec
+                .iter()
+                .filter(|(_, s)| *s > 0)
+                .map(|(name, size)| format!("{name}={}", format_size(*size)))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            if breakdown.is_empty() {
+                CheckResult::Pass(format!("{}, writable", format_size(total)))
+            } else {
+                CheckResult::Pass(format!("{} ({breakdown})", format_size(total)))
+            }
+        }
+        Err(e) => CheckResult::Fail("not writable".into(), format!("Check permissions: {e}")),
+    }
+}
+
+fn check_pdfium() -> CheckResult {
+    #[cfg(not(windows))]
+    {
+        CheckResult::Pass(option_env!("DONSETCH_PDFIUM").unwrap_or("static").into())
+    }
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let dll = exe.parent().unwrap_or(Path::new("")).join("pdfium.dll");
+        if dll.exists() {
+            CheckResult::Pass(option_env!("DONSETCH_PDFIUM").unwrap_or("dll").into())
+        } else {
+            CheckResult::Fail(
+                "pdfium.dll not found".into(),
+                "Reinstall donsetch or copy pdfium.dll next to donsetch.exe".into(),
+            )
+        }
+    }
+}
+
+fn check_ocr_models() -> CheckResult {
+    #[cfg(not(feature = "ocr"))]
+    {
+        CheckResult::Warn("not compiled (build with --features ocr to enable)".into())
+    }
+    #[cfg(feature = "ocr")]
+    {
+        if !crate::pdf::ocr::enabled() {
+            return CheckResult::Warn("disabled (fetch.ocr = false)".into());
+        }
+
+        let dir = crate::pdf::ocr::ocr_cache_dir();
+        if !dir.exists() {
+            return CheckResult::Warn("not cached (downloads on first use)".into());
+        }
+
+        // Count model files (.onnx + .txt dictionary).
+        let models = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .is_some_and(|ext| ext == "onnx" || ext == "txt")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+
+        if models > 0 {
+            CheckResult::Pass(format!("{models} model files cached"))
+        } else {
+            CheckResult::Warn("not cached (downloads on first use)".into())
+        }
+    }
+}
+
+fn check_onnx() -> CheckResult {
+    #[cfg(not(any(feature = "ocr", feature = "rerank")))]
+    {
+        CheckResult::Warn("not compiled (build with --features ocr,rerank to enable)".into())
+    }
+    #[cfg(any(feature = "ocr", feature = "rerank"))]
+    {
+        // Real probe, not a cfg constant: initialize the ONNX
+        // environment and surface the result. A static-link build
+        // whose archive was never linked in fails here instead of
+        // printing a success string (this exact probe would have
+        // caught the v3.3.0 leak on Windows/macOS).
+        #[cfg(not(target_os = "linux"))]
+        {
+            match crate::onnx::ensure_loaded() {
+                Ok(()) => CheckResult::Pass("static link, commit probe ok".into()),
+                Err(e) => CheckResult::Fail("ONNX payload probe failed".into(), e.to_string()),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // noavx builds ship a self-built .so without AVX, so there is
+            // no AVX gate to check: probe the real thing (dlopen + commit)
+            // via ensure_loaded() and report Pass/Fail directly.
+            #[cfg(feature = "noavx")]
+            {
+                match crate::onnx::ensure_loaded() {
+                    Ok(()) => CheckResult::Pass("noavx build, shared library loaded".into()),
+                    Err(e) => CheckResult::Fail("ONNX payload probe failed".into(), e.to_string()),
+                }
+            }
+            #[cfg(not(feature = "noavx"))]
+            {
+                // Check AVX support (disk-cached).
+                let has_avx = crate::cpu::has_avx();
+                if !has_avx {
+                    return CheckResult::Warn(
+                        "CPU lacks AVX : OCR and rerank disabled (all other features work)".into(),
+                    );
+                }
+                // Check shared library presence.
+                let lib_name = "libonnxruntime.so";
+                let found = if let Ok(exe) = std::env::current_exe()
+                    && let Some(parent) = exe.parent()
+                {
+                    parent.join(lib_name).exists()
+                } else {
+                    false
+                };
+                let cache = paths::cache_dir().join("onnx").join(lib_name).exists();
+                if found || cache {
+                    CheckResult::Pass("AVX detected, shared library present".into())
+                } else {
+                    CheckResult::Warn(
+                        "AVX detected but shared library missing : reinstall donsetch".into(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn check_ghost_state() -> CheckResult {
+    let state = crate::ghost::cache::GhostState::load();
+    let domains = state.profiles.len();
+    let renders = state.renders.len();
+    CheckResult::Pass(format!("{domains} domains, {renders} renders cached"))
+}
+
+/// BYOK plugins: registration state only. Never probes the
+/// adapter from doctor (a probe is a real query through user
+/// code; it stays behind the explicit `--test` flag).
+fn check_plugins() -> CheckResult {
+    let cfg = crate::search::byok::plugin::PluginConfig::load();
+    if !cfg.is_configured() {
+        return CheckResult::Pass(
+            "none registered (optional: `donsetch keys add plugin <name> --cmd '...' --test`)"
+                .to_string(),
+        );
+    }
+    let names: Vec<String> = cfg.names().cloned().collect();
+    // Path-form program checks only: PATH lookups are resolved
+    // by the exec at run time, and absence there already yields
+    // a clear error on the first search.
+    let mut missing: Vec<String> = Vec::new();
+    for n in &names {
+        let prog = &cfg.plugins[n].cmd[0];
+        let is_path_form = prog.contains('/') || prog.contains('\\') || prog.starts_with('.');
+        if is_path_form && !std::path::Path::new(prog).exists() {
+            missing.push(format!("{n}: {prog}"));
+        }
+    }
+    let detail = format!(
+        "{} registered ({}), runs at search time",
+        names.len(),
+        names.join(", ")
+    );
+    if missing.is_empty() {
+        CheckResult::Pass(detail)
+    } else {
+        CheckResult::Warn(format!(
+            "{detail}; program not found: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Config layers: conflicts the loader cannot express, missing
+/// explicit paths, and secret-redaction posture. Unknown keys and
+/// range errors already fail at load (`deny_unknown_fields`).
+fn check_config_posture() -> CheckResult {
+    let no_file = std::env::var_os("DONSETCH_NO_CONFIG_FILE").is_some();
+    let explicit = std::env::var_os("DONSETCH_CONFIG");
+    if no_file && explicit.is_some() {
+        return CheckResult::Fail(
+            "DONSETCH_NO_CONFIG_FILE and DONSETCH_CONFIG are both set".into(),
+            "unset one: NO_CONFIG_FILE means 'ignore all files'; DONSETCH_CONFIG names one file to load".into(),
+        );
+    }
+    if let Some(ref path) = explicit {
+        let p = std::path::PathBuf::from(path);
+        if !p.exists() {
+            return CheckResult::Fail(
+                format!("DONSETCH_CONFIG points at a missing file: {}", p.display()),
+                "create the file or unset DONSETCH_CONFIG".into(),
+            );
+        }
+    }
+    // Report layer posture without echoing secrets.
+    let home = dirs::config_dir()
+        .map(|d| d.join("donsetch").join("donsetch.toml"))
+        .filter(|p| p.exists());
+    let mut layers: Vec<&str> = Vec::new();
+    if no_file {
+        layers.push("env-only (NO_CONFIG_FILE)");
+    } else if let Some(ref h) = home {
+        layers.push(if h.exists() { "user toml" } else { "defaults" });
+    } else {
+        layers.push("defaults");
+    }
+    if explicit.is_some() {
+        layers.push("DONSETCH_CONFIG");
+    }
+    // Secret redaction: config show must never print a raw key.
+    // We only assert the redaction helpers exist (they are unit-
+    // tested); a live redaction probe would require inventing a key.
+    CheckResult::Pass(format!("layers: {}", layers.join(" + ")))
+}
+
+/// Search engine + learning receipts, local-only and fast. One
+/// line an agent can trust: is the roster healthy, is learning
+/// on, are the new C kill switches armed.
+fn check_search_health() -> CheckResult {
+    let (trust, trust_intent, failures) = crate::search::persist_load_for_status();
+    let low = trust.values().filter(|&&x| x < 0.5).count()
+        + trust_intent.values().filter(|&&x| x < 0.5).count();
+    let quarantined = failures.len();
+    let (q_hosts, _, _) = crate::search::persist_load_quality_for_status();
+    let (o_keys, o_demoted) = crate::search::persist_load_outcome_for_status();
+    let s = &crate::config::cfg().search;
+    let flags = format!(
+        "early={} compile={} instant={} quality={} outcome={}",
+        onoff(s.search_early),
+        onoff(s.query_compile),
+        onoff(s.serp_instant),
+        onoff(s.quality_prior),
+        onoff(s.outcome_feedback),
+    );
+    // BYOK key states: counts only, never the keys.
+    let store = crate::search::byok::store::ByokConfig::load();
+    let mut active = 0usize;
+    let mut limited = 0usize;
+    let mut dead = 0usize;
+    for p in &store.providers {
+        for k in &p.keys {
+            match k.state {
+                crate::search::byok::store::KeyState::Active => active += 1,
+                crate::search::byok::store::KeyState::RateLimited => limited += 1,
+                crate::search::byok::store::KeyState::CreditDepleted
+                | crate::search::byok::store::KeyState::Invalid => dead += 1,
+            }
+        }
+    }
+    let byok = if active + limited + dead == 0 {
+        "byok none".to_string()
+    } else {
+        format!("byok {active} active / {limited} limited / {dead} dead")
+    };
+    let detail = format!(
+        "trust {} entries ({low} low) · quarantined {quarantined} · quality {q_hosts} · outcome {o_keys} ({o_demoted} demoted) · {byok} · {flags}",
+        trust.len() + trust_intent.len()
+    );
+    if quarantined > 0 && low > 2 {
+        CheckResult::Warn(format!(
+            "{detail}; run a few searches to rebuild trust, or `donsetch status`"
+        ))
+    } else {
+        CheckResult::Pass(detail)
+    }
+}
+
+fn onoff(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
+}
+
+/// Clearance state: TLS-session routes, link handles, cookie vault.
+fn check_clearance_stores() -> CheckResult {
+    let dir = paths::cache_dir();
+    let mut bits: Vec<String> = Vec::new();
+
+    // routes.json: TLS sessions / 0-RTT material.
+    let routes = dir.join("routes.json");
+    if routes.exists() {
+        let n = std::fs::read(&routes)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("routes").and_then(|r| r.as_object()).map(|o| o.len()))
+            .unwrap_or(0);
+        bits.push(format!("routes {n}"));
+    } else {
+        bits.push("routes none".into());
+    }
+
+    // handles.json: link-handle table (24h TTL, cap 2048).
+    let handles = dir.join("handles.json");
+    if handles.exists() {
+        let n = std::fs::read(&handles)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("l")
+                    .or_else(|| v.get("entries"))
+                    .and_then(|o| o.as_object())
+                    .map(|o| o.len())
+            })
+            .unwrap_or(0);
+        bits.push(format!("handles {n}"));
+    } else {
+        bits.push("handles none".into());
+    }
+
+    let vault = onoff(crate::config::cfg().state.cookie_vault);
+    bits.push(format!("cookie_vault {vault}"));
+    CheckResult::Pass(bits.join(" · "))
+}
+
+/// Crawl learning stores: governor host ladders + page history.
+fn check_crawl_stores() -> CheckResult {
+    let dir = paths::cache_dir();
+    let mut bits: Vec<String> = Vec::new();
+    let gov = dir.join("crawl-governor.json");
+    if gov.exists() {
+        let n = std::fs::read(&gov)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("hosts").and_then(|h| h.as_array()).map(|a| a.len()))
+            .unwrap_or(0);
+        bits.push(format!("governor {n} hosts"));
+    } else {
+        bits.push("governor none".into());
+    }
+    let hist = dir.join("page-history.json");
+    if hist.exists() {
+        let size = hist.metadata().map(|m| m.len()).unwrap_or(0);
+        // > 5MB is a store that stopped rotating (or a very heavy
+        // crawl user): worth a warning, not a failure.
+        if size > 5_000_000 {
+            return CheckResult::Warn(format!(
+                "page-history is {} (delete or trim if crawls feel slow)",
+                format_size(size)
+            ));
+        }
+        bits.push(format!("history {}", format_size(size)));
+    } else {
+        bits.push("history none".into());
+    }
+    CheckResult::Pass(bits.join(" · "))
+}
+
+/// DNS resolution, independent of HTTP. Catches the "TLS works
+/// via proxy but the resolver is broken" class that check_network
+/// cannot see.
+fn check_dns() -> CheckResult {
+    use std::net::ToSocketAddrs;
+    match ("example.com", 443u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            if addrs.is_empty() {
+                CheckResult::Fail(
+                    "example.com resolved to zero addresses".into(),
+                    "check /etc/resolv.conf or your VPN DNS".into(),
+                )
+            } else {
+                let v6 = addrs.iter().any(|a| a.is_ipv6());
+                let note = if v6 { " (AAAA present)" } else { " (A only)" };
+                CheckResult::Pass(format!("example.com → {} addr(s){note}", addrs.len()))
+            }
+        }
+        Err(e) => CheckResult::Fail(
+            format!("DNS lookup failed: {e}"),
+            "check /etc/resolv.conf, systemd-resolved, or your VPN DNS".into(),
+        ),
+    }
+}
+
+/// Captive-portal detector (--deep only). gstatic generate_204 is
+/// the industry-standard probe: a clean network returns 204 with an
+/// empty body; a portal rewrites it to a login page.
+async fn check_captive_portal(fetcher: Option<&Fetcher>) -> CheckResult {
+    let Some(fetcher) = fetcher else {
+        return CheckResult::Warn("skipped: fetcher unavailable".into());
+    };
+    match fetcher
+        .fetch("http://connectivitycheck.gstatic.com/generate_204")
+        .await
+    {
+        Ok(out) if out.status == 204 => {
+            CheckResult::Pass("generate_204 returned 204 (no portal)".into())
+        }
+        Ok(out) => CheckResult::Warn(format!(
+            "generate_204 returned {} : possible captive portal (hotel/airport Wi-Fi login page)",
+            out.status
+        )),
+        Err(e) => CheckResult::Warn(format!("portal probe failed: {e}")),
+    }
+}
+
+/// Display form of a key: enough to recognize it, never enough to
+/// use it. Char-based throughout -- the old byte slices panicked on
+/// a key with a multibyte char in the cut position (`parse_key` /
+/// `keys import` never reject non-ASCII), and showed 7 of 8 chars of
+/// a short key.
+fn mask_key(k: &str) -> String {
+    let start = k.split_once("::").map(|(t, _)| t).unwrap_or(k);
+    let n = start.chars().count();
+    if n <= 8 {
+        let shown: String = start.chars().take(n.saturating_sub(1).min(2)).collect();
+        return format!("{shown}***");
+    }
+    let head: String = start.chars().take(6).collect();
+    let tail: String = start
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
+}
+
+/// Bright Data SERP key: local validation + a free live zone probe
+/// in --deep mode (route_ips costs nothing, so the check can
+/// confirm token + zone without spending a cent).
+fn check_brightdata() -> CheckResult {
+    let cfg = crate::search::byok::store::ByokConfig::load();
+    let Some(entry) = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == "brightdata")
+        .and_then(|p| p.keys.first())
+    else {
+        return CheckResult::Warn(
+            "not configured : keyless search still works, but SERP costs nothing to add via `donsetch keys add brightdata <token>[::zone]`"
+                .to_string(),
+        );
+    };
+    let (_, zone) = crate::search::byok::brightdata_key_parts(&entry.key)
+        .unwrap_or_else(|_| (String::new(), String::new()));
+    let masked = mask_key(&entry.key);
+    let state = match entry.state {
+        crate::search::byok::store::KeyState::Active => "active",
+        crate::search::byok::store::KeyState::Invalid => "rejected by Bright Data (fix the token)",
+        crate::search::byok::store::KeyState::CreditDepleted => "out of credits",
+        crate::search::byok::store::KeyState::RateLimited => "rate limited",
+    };
+    if entry.state != crate::search::byok::store::KeyState::Active {
+        return CheckResult::Fail(
+            format!("{masked} on {zone} : {state}"),
+            "`donsetch keys reset brightdata` re-activates the key after you fix the problem on Bright Data's side.".to_string(),
+        );
+    }
+    CheckResult::Pass(format!("{masked} on zone {zone}, {state}"))
+}
+
+fn check_bypass(deep: bool) -> CheckResult {
+    let cfg = crate::search::byok::store::ByokConfig::load();
+    let bc = crate::fetch::bypass::BypassConfig::from_env();
+    if !bc.enabled {
+        return CheckResult::Warn(
+            "integration disabled by DONSETCH_BYPASS=0 : walled sites will end on the tier-2 path instead of the solver"
+                .to_string(),
+        );
+    }
+    let Some(key) = crate::fetch::bypass::active_unlocker_key(&cfg) else {
+        return CheckResult::Warn(
+            "not configured (optional, opt-in: donsetch keys add unlocker <key>[::zone])"
+                .to_string(),
+        );
+    };
+    let parsed = crate::fetch::bypass::parse_key(&key, crate::fetch::bypass::DEFAULT_ZONE);
+    let (_, zone) = match &parsed {
+        Ok((t, z)) => (t.clone(), z.clone()),
+        Err(_) => (String::new(), String::new()),
+    };
+    let masked = mask_key(&key);
+    if let Err(e) = &parsed {
+        return CheckResult::Fail(
+            format!("{masked} looks broken : {e}"),
+            "`donsetch keys add unlocker <token>[::zone]` replaces the key with a valid one."
+                .to_string(),
+        );
+    }
+    // Daily cap state: how close are we to the ceiling today?
+    let count_path = crate::fetch::bypass::bypass_count_path(&crate::paths::cache_dir());
+    let used: u32 = std::fs::read_to_string(&count_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let cap_note = if used >= bc.max_daily {
+        ", daily cap reached (raise DONSETCH_BYPASS_MAX_DAILY to keep unlocking)".to_string()
+    } else {
+        format!(", {used}/{} daily unlocks used", bc.max_daily)
+    };
+    // Solve-cache state.
+    let cache_dir = crate::fetch::bypass::bypass_cache_dir(&crate::paths::cache_dir());
+    let cache_n: usize = std::fs::read_dir(&cache_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+    let cache_note = if bc.cache_ttl.is_zero() {
+        ", solve-cache disabled via DONSETCH_BYPASS_CACHE=0".to_string()
+    } else {
+        format!(", {cache_n} pages cached")
+    };
+    let base = format!(
+        "{masked} on zone {zone}{cap_note}{cache_note}, render-on-solve {}",
+        if bc.render { "on" } else { "off" }
+    );
+    // --deep: live, free zone validation (route_ips endpoint).
+    if deep {
+        let zone_for_probe = zone.clone();
+        let token_for_probe = key
+            .split_once("::")
+            .map(|(t, _)| t.to_string())
+            .unwrap_or_else(|| key.clone());
+        match std::thread::Builder::new()
+            .name("bd-probe".into())
+            .spawn(move || bright_zone_probe(&token_for_probe, &zone_for_probe))
+        {
+            Ok(handle) => match handle.join() {
+                Ok(ZoneProbeOut::Routed(n)) => {
+                    CheckResult::Pass(format!("{base} ; live zone probe OK ({n} IPs routed)"))
+                }
+                Ok(ZoneProbeOut::Skipped { reason }) => CheckResult::Pass(format!(
+                    "{base} ; live zone probe skipped: {reason} (no credits spent, nothing billed)"
+                )),
+                Ok(ZoneProbeOut::Failed { reason }) => CheckResult::Warn(format!(
+                    "{base} ; live zone probe failed: {reason} (free check, nothing billed)"
+                )),
+                Err(_) => CheckResult::Pass(base),
+            },
+            Err(_) => CheckResult::Pass(base),
+        }
+    } else {
+        CheckResult::Pass(base)
+    }
+}
+
+/// The result of the free Bright Data zone probe.
+#[derive(Debug, PartialEq, Eq)]
+enum ZoneProbeOut {
+    /// The zone answered with its IP count.
+    Routed(usize),
+    /// The zone is valid-shaped but has no static pool to list
+    /// (Web Access API and other dynamic-IP zones): Bright Data
+    /// answers 403 "Static routes not found". Not a failure; the
+    /// token simply cannot be exercised without spending a credit.
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+/// Classify the route_ips HTTP answer before any JSON parsing.
+/// The distinction that matters: a 401 is a bad token, a 403 that
+/// says the zone has no static pool is a skip (never a failure),
+/// and every other non-200 stays a plain failure.
+fn classify_route_ips(status: u16, body: &str) -> ZoneProbeOut {
+    if status == 200 {
+        return ZoneProbeOut::Routed(0); // count parsed by the caller
+    }
+    if status == 401 {
+        return ZoneProbeOut::Failed {
+            reason: "the token was rejected (401) : check it in the Bright Data dashboard"
+                .to_string(),
+        };
+    }
+    if status == 403 {
+        let lower = body.to_ascii_lowercase();
+        if lower.contains("static routes") && lower.contains("not found") {
+            return ZoneProbeOut::Skipped {
+                reason: "the zone type has no static route pool (Bright Data: Static routes not found) : dynamic zones such as Web Access API cannot be pre-checked without spending a credit"
+                    .to_string(),
+            };
+        }
+        return ZoneProbeOut::Failed {
+            reason: "the zone name or access was refused (403) : check the zone spelling in the dashboard"
+                .to_string(),
+        };
+    }
+    ZoneProbeOut::Failed {
+        reason: format!("HTTP {status}"),
+    }
+}
+
+/// Bright Data API root. The route_ips endpoint is appended by
+/// `route_ips_url`; `bright_zone_probe_at` takes this root (the
+/// production value here, a local rig root in tests) and never the
+/// full endpoint, or the appended path would double.
+const BRIGHT_API_BASE: &str = "https://api.brightdata.com";
+
+/// The zone route_ips URL for a base. Kept separate so the ship
+/// path and the test rig build the URL the same way: pass the API
+/// ROOT, the endpoint path is appended exactly once.
+fn route_ips_url(base: &str, zone: &str) -> String {
+    format!("{base}/zone/route_ips?zone={zone}")
+}
+
+/// Free Bright Data validation: the zone route_ips endpoint lists
+/// the zone's IP pool without making a request, so a dead token or
+/// wrong zone name shows up here before the first paid unlock.
+fn bright_zone_probe(token: &str, zone: &str) -> ZoneProbeOut {
+    bright_zone_probe_at(BRIGHT_API_BASE, token, zone)
+}
+
+/// The probe against an API base (the production root in the ship
+/// path, a local rig root in tests); the route_ips endpoint is
+/// appended by `route_ips_url`.
+fn bright_zone_probe_at(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return ZoneProbeOut::Failed {
+                reason: format!("runtime: {e}"),
+            };
+        }
+    };
+    rt.block_on(bright_zone_probe_async(base, token, zone))
+}
+
+async fn bright_zone_probe_async(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ZoneProbeOut::Failed {
+                reason: format!("client: {e}"),
+            };
+        }
+    };
+    let url = route_ips_url(base, zone);
+    let resp = match client.get(url).bearer_auth(token).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return ZoneProbeOut::Failed {
+                reason: format!("request: {e}"),
+            };
+        }
+    };
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    let mut out = classify_route_ips(status, &body);
+    if let ZoneProbeOut::Routed(ref mut n) = out {
+        *n = match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => {
+                if let Some(count) = v.get("ip_count").and_then(|x| x.as_u64()) {
+                    count as usize
+                } else if let Some(ips) = v.get("ips").and_then(|x| x.as_array()) {
+                    ips.len()
+                } else {
+                    0
+                }
+            }
+            Err(e) => {
+                return ZoneProbeOut::Failed {
+                    reason: format!("parse: {e}"),
+                };
+            }
+        };
+    }
+    out
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+
+/// Recursively sum file sizes under `path`. Capped at ~1GB to
+/// avoid walking pathological trees.
+fn dir_size(path: &Path) -> u64 {
+    fn walk(path: &Path, total: &mut u64) {
+        if *total > 1_000_000_000 {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, total);
+                } else if let Ok(meta) = entry.metadata() {
+                    *total += meta.len();
+                }
+            }
+        }
+    }
+
+    let mut total = 0u64;
+    walk(path, &mut total);
+    total
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1}MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1}KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+/// Print the structured doctor report for agent/CI consumers.
+/// Emitted AFTER the human-readable output on stdout; consumers
+/// using --json are expected to parse the trailing JSON document.
+fn print_json_summary(
+    collected: &[(String, String, String, String)],
+    p: u32,
+    w: u32,
+    f: u32,
+    deep: bool,
+) {
+    use serde_json::json;
+    let checks: Vec<serde_json::Value> = collected
+        .iter()
+        .map(|(name, status, detail, hint)| {
+            json!({
+                "name": name,
+                "status": status,
+                "detail": detail,
+                "hint": hint,
+            })
+        })
+        .collect();
+    let doc = json!({
+        "doctor": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "mode": if deep { "deep" } else { "fast" },
+            "summary": { "passed": p, "warnings": w, "failed": f },
+            "checks": checks,
+        }
+    });
+    println!("\n__DONSETCH_DOCTOR_JSON__");
+    println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+}
+
+/// Detect installed MCP clients and print ready-to-paste
+/// registration blocks. Clients manage their own process model,
+/// so the block is the stdio form; donsetch's own supervisor
+/// (--supervised) is the recommended argv for every client.
+fn print_mcp_section() {
+    println!();
+    println!("  {}", cli::bold("MCP client registration"));
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "donsetch".to_string());
+    let npm_install =
+        exe.contains("node_modules/donsetch/") || exe.contains("node_modules\\donsetch\\");
+    let command = if npm_install { "donsetch" } else { &exe };
+    let found = detect_mcp_clients();
+    if found.is_empty() {
+        cli::check_dim("MCP clients", "none detected; generic stdio block below");
+    } else {
+        for (client, path) in &found {
+            cli::check_pass(
+                &format!("{client} (detected)"),
+                &format!("config at {}", path.display()),
+            );
+        }
+    }
+    let generic = format!(
+        "{{\"mcpServers\": {{\"donsetch\": {{\"command\": {}, \
+         \"args\": [\"mcp\", \"--supervised\"]}}}}}}",
+        json_escape(command)
+    );
+    println!("      Add to an MCP client (Claude Desktop, OpenCode, .mcp.json):");
+    println!("      {generic}");
+    println!("      Hermes (~/.hermes/config.yaml):");
+    println!("        mcp_servers:");
+    println!("          donsetch:");
+    println!("            command: {command}");
+    println!("            args: [\"mcp\", \"--supervised\"]");
+    println!("            transport: stdio");
+    if npm_install {
+        println!("      For npm installs, use `npx donsetch` if `donsetch` is not on PATH.");
+    }
+    println!("      Supervised mode restarts donsetch if it is ever killed,",);
+    println!("      which is why the blocks above prefer it.");
+}
+
+fn json_escape(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Known MCP client config locations. Only these small fixed files
+/// are probed: detection is cheap and never scans the filesystem.
+fn detect_mcp_clients() -> Vec<(String, std::path::PathBuf)> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let mut out = Vec::new();
+    let mut add = |id: &str, p: std::path::PathBuf| {
+        if p.exists() {
+            out.push((id.to_string(), p));
+        }
+    };
+    if let Some(h) = &home {
+        add(
+            "Claude Desktop (macOS)",
+            h.join("Library/Application Support/Claude/claude_desktop_config.json"),
+        );
+        add(
+            "Claude Desktop (Windows)",
+            h.join("AppData/Roaming/Claude/claude_desktop_config.json"),
+        );
+        add("OpenCode", h.join(".config/opencode/opencode.json"));
+        add("Hermes", h.join(".hermes/config.yaml"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        add(".mcp.json", cwd.join(".mcp.json"));
+        if let Some(h) = &home {
+            add(".mcp.json (home)", h.join(".mcp.json"));
+        }
+    }
+    out
+}
+
+/// Apply safe, reversible repairs for the mechanical failure
+/// classes the checks can produce. Anything destructive (profile
+/// deletion, key removal) is deliberately out of scope: repair
+/// only what cannot hurt. Re-run repaired checks once to report
+/// the true post-repair state.
+async fn apply_fixes(collected: &mut [(String, String, String, String)]) -> Result<(), String> {
+    let failed: Vec<String> = collected
+        .iter()
+        .filter(|(_, status, _, _)| status == "fail")
+        .map(|(n, _, _, _)| n.clone())
+        .collect();
+    if failed.is_empty() {
+        println!("  {}: nothing to repair", cli::green("--fix"));
+        return Ok(());
+    }
+
+    for name in &failed {
+        match name.as_str() {
+            "Cache directory" => {
+                let dir = crate::paths::cache_dir();
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    cli::check_fixed("Cache directory", &format!("created {}", dir.display()));
+                }
+            }
+            "Ghost state" => {
+                // state file is designed to be resettable; the lock
+                // file is stale-safe. Remove both.
+                let dir = crate::paths::cache_dir();
+                let _ = std::fs::remove_file(dir.join("ghost-state.json"));
+                if let Ok(cwd) = std::env::current_dir() {
+                    let _ = std::fs::remove_file(cwd.join(".donsetch-ghost.lock"));
+                }
+                cli::check_fixed("Ghost state", "reset state; browser profile untouched");
+            }
+            "OCR models" | "Rerank model" => {
+                // Corrupt/missing models re-download automatically on
+                // first use; nothing to do here except confirm that.
+                if let Ok(dir) = std::fs::read_dir(crate::paths::cache_dir().join("ocr")) {
+                    for e in dir.flatten() {
+                        if e.path().is_file() && e.path().extension().is_none_or(|x| x != "json") {
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                    }
+                }
+                cli::check_fixed(name, "corrupt models will re-download on next use");
+            }
+            _ => {}
+        }
+    }
+    println!();
+    println!(
+        "  {}: re-run `donsetch doctor` to confirm",
+        cli::bold("done")
+    );
+    Ok(())
+}
+
+/// The stealth drift scorecard (v4 phase 0.4). Exit codes: 0 all
+/// layers match the baseline, 1 drift or capture failure
+/// (--stealth-record writes the fixture and exits 0 on success).
+/// --parity (v4 phase 1.1) instead diffs the live tier-1 capture
+/// against the REAL local browser (ghost): the evergreen check,
+/// no fixture involved. It cannot go stale; it fails when the
+/// profile and the floor diverge.
+async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
+    use crate::profile::scorecard;
+
+    cli::print_title(&format!("{DISPLAY_NAME} Stealth Scorecard"));
+    println!();
+
+    let fetcher = match Fetcher::new(crate::profile::BrowserProfile::host_default()) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("  fetcher init failed: {e}");
+            return 1;
+        }
+    };
+    let live = match scorecard::capture(&fetcher).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("  capture failed: {e}");
+            eprintln!("  (the echo endpoint is unreachable; retry or check egress)");
+            return 1;
+        }
+    };
+
+    if parity {
+        let mgr = crate::ghost::manager::GhostManager::new().await;
+        return match scorecard::capture_via_ghost(&mgr).await {
+            Ok(ghost) => {
+                let report = scorecard::diff(&ghost, &live);
+                let bad = report.iter().filter(|v| !v.same).count();
+                println!("  parity scope: tier-1 vs LOCAL BROWSER (fixtureless, evergreen)");
+                println!();
+                for v in &report {
+                    let mark = if v.same { "ok  " } else { "DIFF" };
+                    println!("  [{mark}] {:<8}", v.layer);
+                    if !v.same {
+                        println!("       tier1:   {}", v.live);
+                        println!("       browser: {}", v.baseline);
+                    }
+                }
+                println!();
+                if bad == 0 {
+                    println!("  parity: tier 1 matches the local browser. Evergreen.");
+                    0
+                } else {
+                    eprintln!("  {bad} layer(s) diverged from the local browser.");
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("  ghost parity unavailable: {e}");
+                eprintln!("  (need a local Chrome: ghost must render the echo once)");
+                // Parity is best-effort evergreen, not the fixture gate.
+                1
+            }
+        };
+    }
+
+    if record {
+        let mut fixture = live.clone();
+        fixture.source = format!(
+            "tier1 fetcher, profile {}, recorded via --stealth-record",
+            fetcher.profile().name
+        );
+        fixture.captured_at = "operator-recorded".to_string();
+        let path = "tests/fixtures/stealth-baseline.json";
+        match serde_json::to_string_pretty(&fixture) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(path, format!("{text}\n")) {
+                    eprintln!("  could not write {path}: {e}");
+                    return 1;
+                }
+                println!("  baseline recorded to {path}");
+                println!("  review the diff, then rebuild: the fixture is embedded at build time");
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("  could not serialize fixture: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let baseline = match scorecard::baseline_fixture() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("  {e}");
+            return 1;
+        }
+    };
+    let verdicts = scorecard::diff(&baseline, &live);
+    let mut drifted = 0;
+    if json {
+        let layers: Vec<serde_json::Value> = verdicts
+            .iter()
+            .map(|v| {
+                serde_json::json!({
+                    "layer": v.layer,
+                    "same": v.same,
+                    "baseline": v.baseline,
+                    "live": v.live,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "endpoint": scorecard::ECHO_ENDPOINT,
+                "profile": live.profile,
+                "drifted": verdicts.iter().filter(|v| !v.same).count(),
+                "layers": layers,
+            }))
+            .unwrap()
+        );
+    } else {
+        for v in &verdicts {
+            if v.same {
+                cli::check_pass(v.layer, "matches baseline");
+            } else {
+                drifted += 1;
+                cli::check_fail(
+                    v.layer,
+                    "DRIFTED",
+                    "re-capture the profile and re-record the baseline deliberately",
+                );
+                println!("      baseline: {}", v.baseline);
+                println!("      live:     {}", v.live);
+            }
+        }
+        println!();
+        if drifted == 0 {
+            println!("  all layers match the baseline; no drift");
+        } else {
+            println!("  {drifted} layer(s) drifted. If Chrome bumped, re-capture the profile");
+            println!("  and re-record the baseline deliberately: donsetch doctor --stealth-record");
+        }
+    }
+    if drifted == 0 { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod doctor_ultra_tests {
+    use super::*;
+
+    fn isolated_cache() -> tempfile_dir::TempDir {
+        // Hand-rolled: we do not want a tempfile dep just for this.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "donsetch-doctor-ultra-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        tempfile_dir::TempDir { dir }
+    }
+
+    mod tempfile_dir {
+        pub struct TempDir {
+            pub dir: std::path::PathBuf,
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+    }
+
+    #[test]
+    fn config_posture_flags_no_config_file_plus_explicit_path() {
+        let _g = isolated_cache();
+        unsafe {
+            std::env::set_var("DONSETCH_NO_CONFIG_FILE", "1");
+            std::env::set_var("DONSETCH_CONFIG", "/nonexistent/donsetch.toml");
+        }
+        let r = check_config_posture();
+        unsafe {
+            std::env::remove_var("DONSETCH_NO_CONFIG_FILE");
+            std::env::remove_var("DONSETCH_CONFIG");
+        }
+        match r {
+            CheckResult::Fail(detail, _) => {
+                assert!(detail.contains("both set"), "{detail}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_posture_flags_missing_explicit_config() {
+        let _g = isolated_cache();
+        unsafe {
+            std::env::remove_var("DONSETCH_NO_CONFIG_FILE");
+            std::env::set_var("DONSETCH_CONFIG", "/nonexistent/donsetch.toml");
+        }
+        let r = check_config_posture();
+        unsafe {
+            std::env::remove_var("DONSETCH_CONFIG");
+        }
+        match r {
+            CheckResult::Fail(detail, _) => {
+                assert!(detail.contains("missing file"), "{detail}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_health_reports_kill_switches() {
+        let _g = isolated_cache();
+        let r = check_search_health();
+        let detail = match r {
+            CheckResult::Pass(d) | CheckResult::Warn(d) => d,
+            CheckResult::Fail(d, _) => d,
+            CheckResult::Fixed(d) => d,
+        };
+        assert!(detail.contains("early="), "{detail}");
+        assert!(detail.contains("compile="), "{detail}");
+        assert!(detail.contains("instant="), "{detail}");
+        assert!(detail.contains("byok"), "{detail}");
+    }
+
+    #[test]
+    fn clearance_and_crawl_stores_tolerate_missing_files() {
+        let _g = isolated_cache();
+        let c = check_clearance_stores();
+        assert!(
+            matches!(c, CheckResult::Pass(_)),
+            "clearance must pass on empty cache"
+        );
+        let k = check_crawl_stores();
+        assert!(
+            matches!(k, CheckResult::Pass(_)),
+            "crawl must pass on empty cache"
+        );
+    }
+
+    #[test]
+    fn state_permissions_tightens_world_readable_secret_files() {
+        let _g = isolated_cache();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let f = paths::cache_dir().join("routes.json");
+            std::fs::write(&f, b"{}").unwrap();
+            let mut perm = std::fs::metadata(&f).unwrap().permissions();
+            perm.set_mode(0o644);
+            std::fs::set_permissions(&f, perm).unwrap();
+            match check_state_permissions() {
+                CheckResult::Fixed(d) => {
+                    assert!(d.contains("routes.json"), "{d}");
+                }
+                other => panic!("expected Fixed, got {other:?}"),
+            }
+            let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_key;
+
+    #[test]
+    fn mask_key_is_char_safe_and_never_shows_most_of_a_short_key() {
+        // 8 bytes, 7 chars, last char multibyte: `&start[..7]` panicked.
+        assert_eq!(mask_key("abcdefé"), "ab***");
+        // All-multibyte short key.
+        assert_eq!(mask_key("密钥测试"), "密钥***");
+        // Degenerate lengths.
+        assert_eq!(mask_key(""), "***");
+        assert_eq!(mask_key("a"), "***");
+        assert_eq!(mask_key("ab"), "a***");
+        // A real-length key keeps the recognizable head...tail shape.
+        assert_eq!(
+            mask_key("sk-abcdefghijklmnopqrstuvwxyz0123"),
+            "sk-abc...0123"
+        );
+        // Multibyte at both cut positions.
+        assert_eq!(mask_key("ключключключключ"), "ключкл...ключ");
+        // Bright Data `token::zone` keys mask the token only.
+        assert_eq!(mask_key("0123456789abcdef::my_zone"), "012345...cdef");
+    }
+}
+
+#[cfg(test)]
+mod bright_probe_tests {
+    use super::{
+        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, json_escape,
+        route_ips_url,
+    };
+    use std::io::{Read, Write};
+
+    /// A one-request HTTP rig: serves `status` + `body`, records the
+    /// request head so the test can assert the auth and path shape.
+    fn serve_once(
+        status: u16,
+        reason: &str,
+        body: &str,
+    ) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let reason = reason.to_string();
+        let body = body.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = sock.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            head
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn classify_static_routes_403_is_a_skip_not_a_failure() {
+        // The bug class: a valid dynamic zone (Web Access API) gets
+        // 403 "Static routes not found". Pre-fix this was a blanket
+        // 401/403 == token-rejected failure.
+        let cases: Vec<(u16, &str, ZoneProbeOut)> = vec![
+            (
+                403,
+                r#"{"message":"Static routes not found"}"#,
+                ZoneProbeOut::Skipped {
+                    reason: String::new(),
+                },
+            ),
+            (
+                403,
+                r#"{"error":{"code":"static_routes_not_found","message":"STATIC ROUTES NOT FOUND"}}"#,
+                ZoneProbeOut::Skipped {
+                    reason: String::new(),
+                },
+            ),
+            (
+                401,
+                r#"{"message":"unauthorized"}"#,
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                403,
+                r#"{"message":"Zone name is invalid"}"#,
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                403,
+                "",
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                404,
+                "nope",
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                429,
+                "slow down",
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                500,
+                "boom",
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                std::mem::discriminant(&classify_route_ips(status, body)),
+                std::mem::discriminant(&expected),
+                "status {status} body {body:?}"
+            );
+        }
+        // The skip reason carries the diagnosis, not a generic one.
+        match classify_route_ips(403, r#"{"message":"Static routes not found"}"#) {
+            ZoneProbeOut::Skipped { reason } => {
+                assert!(reason.contains("no static route pool"), "{reason}");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // 200 parse happens in the caller; the classifier only tags it.
+        assert_eq!(classify_route_ips(200, "{}"), ZoneProbeOut::Routed(0));
+    }
+
+    // The production probe must hit .../zone/route_ips exactly once.
+    // The ship base used to be the full endpoint while route_ips_url
+    // appends the endpoint again, so the real request went to
+    // /zone/route_ips/zone/route_ips (a 404) and every configured
+    // Bright Data zone read as a failed probe. The wire tests missed
+    // it because they pass a bare-root rig base. Pin the ship URL.
+    #[test]
+    fn production_route_ips_url_has_a_single_endpoint_path() {
+        let url = route_ips_url(BRIGHT_API_BASE, "web-access");
+        assert_eq!(
+            url,
+            "https://api.brightdata.com/zone/route_ips?zone=web-access"
+        );
+        assert_eq!(
+            url.matches("/zone/route_ips").count(),
+            1,
+            "the endpoint path must not be doubled: {url}"
+        );
+    }
+
+    #[test]
+    fn wire_dynamic_zone_403_reports_skipped_not_failed() {
+        let (base, handle) = serve_once(
+            403,
+            "Forbidden",
+            r#"{"status":403,"message":"Static routes not found"}"#,
+        );
+        let out = bright_zone_probe_at(&base, "tok", "web-access");
+        match &out {
+            ZoneProbeOut::Skipped { reason } => {
+                assert!(reason.contains("no static route pool"), "{reason}");
+                assert!(!reason.contains("rejected"), "{reason}");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // The wire path really hit OUR rig with the right auth + path.
+        let head = String::from_utf8_lossy(&handle.join().unwrap()).into_owned();
+        let head_l = head.to_ascii_lowercase();
+        assert!(
+            head_l.contains("get /zone/route_ips?zone=web-access http/1.1"),
+            "{head}"
+        );
+        assert!(head_l.contains("authorization: bearer tok"), "{head}");
+    }
+
+    #[test]
+    fn wire_200_returns_the_ip_count() {
+        let (base, handle) =
+            serve_once(200, "OK", r#"{"ips":[{"ip":"1.2.3.4"},{"ip":"5.6.7.8"}]}"#);
+        let out = bright_zone_probe_at(&base, "tok", "static-zone");
+        assert_eq!(out, ZoneProbeOut::Routed(2));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn wire_401_stays_a_failure() {
+        let (base, handle) = serve_once(401, "Unauthorized", r#"{"message":"bad token"}"#);
+        match bright_zone_probe_at(&base, "dead-token", "any-zone") {
+            ZoneProbeOut::Failed { reason } => assert!(reason.contains("401"), "{reason}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn json_escape_handles_windows_paths() {
+        let path = r#"C:\Users\A "B"\donsetch.exe"#;
+        assert_eq!(json_escape(path), r#""C:\\Users\\A \"B\"\\donsetch.exe""#);
+    }
+}
